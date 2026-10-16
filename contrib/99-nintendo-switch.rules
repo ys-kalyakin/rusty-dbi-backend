@@ -1,0 +1,2 @@
+# Allow users in the "plugdev" group to access the Nintendo Switch DBI USB device.
+SUBSYSTEM=="usb", ATTR{idVendor}=="057e", ATTR{idProduct}=="3000", MODE="0660", GROUP="plugdev"
