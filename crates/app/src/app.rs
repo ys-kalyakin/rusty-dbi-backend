@@ -25,7 +25,7 @@ pub enum ServerStatus {
 }
 
 /// What the caller should do after a key press.
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Action {
     None,
     Start,
@@ -188,4 +188,40 @@ pub fn ui(frame: &mut Frame, app: &App) {
     };
     let status_widget = Paragraph::new(status).style(Style::default().fg(Color::Yellow));
     frame.render_widget(status_widget, chunks[2]);
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crossterm::event::KeyModifiers;
+
+    fn press(c: char) -> KeyEvent {
+        KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
+    }
+
+    #[test]
+    fn push_log_caps_at_max_lines() {
+        let mut app = App::new(FileList::new());
+        for i in 0..(MAX_LOG_LINES + 50) {
+            app.push_log(i.to_string());
+        }
+        assert_eq!(app.log.len(), MAX_LOG_LINES);
+    }
+
+    #[test]
+    fn q_requests_quit() {
+        let mut app = App::new(FileList::new());
+        assert_eq!(app.handle_key(press('q')), Action::Quit);
+        assert!(app.should_quit);
+    }
+
+    #[test]
+    fn s_starts_only_when_files_present_and_only_once() {
+        let mut app = App::new(FileList::new());
+        assert_eq!(app.handle_key(press('s')), Action::None);
+
+        app.files.insert("a", "/tmp/a");
+        assert_eq!(app.handle_key(press('s')), Action::Start);
+        assert_eq!(app.handle_key(press('s')), Action::None);
+    }
 }

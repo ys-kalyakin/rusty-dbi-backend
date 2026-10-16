@@ -34,16 +34,21 @@ async fn main() -> Result<()> {
     let mut ticker = tokio::time::interval(Duration::from_millis(200));
 
     loop {
-        terminal.draw(|frame| app::ui(frame, &app))?;
+        if let Err(e) = terminal.draw(|frame| app::ui(frame, &app)) {
+            ratatui::restore();
+            return Err(e.into());
+        }
 
         tokio::select! {
             maybe_event = input_rx.recv() => {
-                if let Some(Event::Key(key)) = maybe_event {
-                    match app.handle_key(key) {
+                match maybe_event {
+                    Some(Event::Key(key)) => match app.handle_key(key) {
                         Action::Start => app::spawn_server(app.files.clone(), log_tx.clone()),
                         Action::Quit => break,
                         Action::None => {}
-                    }
+                    },
+                    Some(_) => {}
+                    None => break,
                 }
             }
             Some(line) = log_rx.recv() => app.push_log(line),
