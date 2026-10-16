@@ -73,7 +73,7 @@ impl Transport for UsbTransport {
             .next_complete()
             .await
             .into_result()
-            .map_err(|e| TransportError::Usb(format!("{e:?}")))?;
+            .map_err(|e| TransportError::Usb(format!("{e}")))?;
         let data = buffer.into_vec();
         if data.len() < len {
             return Err(TransportError::ShortRead {
@@ -91,7 +91,7 @@ impl Transport for UsbTransport {
             .next_complete()
             .await
             .into_result()
-            .map_err(|e| TransportError::Usb(format!("{e:?}")))?;
+            .map_err(|e| TransportError::Usb(format!("{e}")))?;
         Ok(())
     }
 }

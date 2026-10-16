@@ -24,7 +24,6 @@ pub trait Transport: Send {
 
 /// Round `n` up to the next multiple of `m` (USB IN transfers must request a
 /// multiple of the endpoint's max packet size). Never returns 0 for a nonzero `m`.
-#[allow(dead_code)]
 pub(crate) fn round_up(n: usize, m: usize) -> usize {
     if m == 0 {
         return n;
