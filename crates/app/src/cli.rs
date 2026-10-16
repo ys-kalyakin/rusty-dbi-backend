@@ -31,4 +31,9 @@ mod tests {
         let cli = Cli::try_parse_from(["dbi-backend"]).unwrap();
         assert!(cli.paths.is_empty());
     }
+
+    #[test]
+    fn rejects_unknown_flag() {
+        assert!(Cli::try_parse_from(["dbi-backend", "--nope"]).is_err());
+    }
 }
