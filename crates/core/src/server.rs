@@ -11,6 +11,8 @@ pub enum ServerError {
     Transport(#[from] TransportError),
     #[error("protocol error: {0}")]
     Protocol(String),
+    #[error("cannot serve range: {0}")]
+    Range(String),
 }
 
 /// Upper bound accepted for a FILE_RANGE request body (16-byte fixed part plus the file
@@ -114,19 +116,25 @@ impl<T: Transport> Server<T> {
 
         let Some(path) = self.files.get(&range.name).cloned() else {
             log(format!("Unknown file: {}", range.name));
-            return Ok(());
+            return Err(ServerError::Range(format!("unknown file: {}", range.name)));
         };
 
         let mut file = match std::fs::File::open(&path) {
             Ok(f) => f,
             Err(e) => {
                 log(format!("Failed to open {}: {e}", path.display()));
-                return Ok(());
+                return Err(ServerError::Range(format!(
+                    "failed to open {}: {e}",
+                    path.display()
+                )));
             }
         };
         if let Err(e) = file.seek(SeekFrom::Start(range.range_offset)) {
             log(format!("Failed to seek {}: {e}", path.display()));
-            return Ok(());
+            return Err(ServerError::Range(format!(
+                "failed to seek {}: {e}",
+                path.display()
+            )));
         }
 
         let mut remaining = range.range_size as usize;
@@ -137,18 +145,22 @@ impl<T: Transport> Server<T> {
                 Ok(n) => n,
                 Err(e) => {
                     log(format!("Read failed for {}: {e}", path.display()));
-                    break;
+                    return Err(ServerError::Range(format!(
+                        "read failed for {}: {e}",
+                        path.display()
+                    )));
                 }
             };
             if n == 0 {
-                if remaining > 0 {
-                    log(format!(
-                        "Short transfer for {}: {} bytes remaining",
-                        path.display(),
-                        remaining
-                    ));
-                }
-                break;
+                log(format!(
+                    "Short transfer for {}: {} bytes remaining",
+                    path.display(),
+                    remaining
+                ));
+                return Err(ServerError::Range(format!(
+                    "short transfer for {}: {remaining} bytes remaining",
+                    path.display()
+                )));
             }
             self.transport.write(&buffer[..n]).await?;
             remaining -= n;

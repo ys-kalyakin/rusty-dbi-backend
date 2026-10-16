@@ -19,6 +19,7 @@ pub struct UsbTransport {
     ep_in: nusb::Endpoint<Bulk, In>,
     ep_out: nusb::Endpoint<Bulk, Out>,
     in_packet_size: usize,
+    write_buf: Vec<u8>,
     _interface: Interface,
 }
 
@@ -56,6 +57,7 @@ impl UsbTransport {
                 ep_in,
                 ep_out,
                 in_packet_size,
+                write_buf: Vec::new(),
                 _interface: interface,
             });
         }
@@ -68,29 +70,32 @@ impl Transport for UsbTransport {
         let request = round_up(len, self.in_packet_size);
         let buffer = Buffer::new(request);
         self.ep_in.submit(buffer);
-        let buffer = self
-            .ep_in
-            .next_complete()
-            .await
-            .into_result()
+        let completion = self.ep_in.next_complete().await;
+        let mut data = completion.buffer.into_vec();
+        completion
+            .status
             .map_err(|e| TransportError::Usb(format!("{e}")))?;
-        let data = buffer.into_vec();
         if data.len() < len {
             return Err(TransportError::ShortRead {
                 expected: len,
                 got: data.len(),
             });
         }
-        Ok(data[..len].to_vec())
+        data.truncate(len);
+        Ok(data)
     }
 
     async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
-        let buffer: Buffer = data.to_vec().into();
-        self.ep_out.submit(buffer);
-        self.ep_out
-            .next_complete()
-            .await
-            .into_result()
+        // Reuse the allocation across chunks: recover the buffer from the
+        // previous transfer and refill it instead of allocating a new one.
+        let mut buf = std::mem::take(&mut self.write_buf);
+        buf.clear();
+        buf.extend_from_slice(data);
+        self.ep_out.submit(buf.into());
+        let completion = self.ep_out.next_complete().await;
+        self.write_buf = completion.buffer.into_vec();
+        completion
+            .status
             .map_err(|e| TransportError::Usb(format!("{e}")))?;
         Ok(())
     }

@@ -24,7 +24,11 @@ dbi-backend ~/games
 dbi-backend game1.nsp game2.nsp
 ```
 
-Keys: `a` add a path, `c` clear the list, `s` start the server, `q` quit.
+Keys: `a` open the path picker, `c` clear the list, `s` start the server, `q`
+quit. While the server is running, `a` and `c` are disabled so the offered list
+matches the running server's snapshot. In the picker: `j`/`k` or the arrow keys
+move, `Enter` opens a directory or adds a file, `Space` adds the highlighted
+directory or file, `Backspace` goes up, and `Esc`/`q` cancels.
 
 ## Linux permissions
 

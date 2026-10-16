@@ -52,9 +52,9 @@ impl Header {
             return None;
         }
         let magic = [buf[0], buf[1], buf[2], buf[3]];
-        let cmd_type = u32::from_le_bytes(buf[4..8].try_into().unwrap());
-        let cmd_id = u32::from_le_bytes(buf[8..12].try_into().unwrap());
-        let data_size = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+        let cmd_type = u32::from_le_bytes(buf[4..8].try_into().ok()?);
+        let cmd_id = u32::from_le_bytes(buf[8..12].try_into().ok()?);
+        let data_size = u32::from_le_bytes(buf[12..16].try_into().ok()?);
         Some(Header {
             magic,
             cmd_type,
@@ -79,15 +79,20 @@ pub struct FileRangeHeader {
 }
 
 impl FileRangeHeader {
-    /// Parse from a buffer holding at least 16 bytes followed by the UTF-8 name.
+    /// Parse from a buffer holding the 16-byte fixed part followed by exactly
+    /// `name_len` UTF-8 bytes. Returns `None` if the buffer is too short for the
+    /// fixed part or the declared name, or if the name is not valid UTF-8.
     pub fn parse(buf: &[u8]) -> Option<FileRangeHeader> {
         if buf.len() < HEADER_LEN {
             return None;
         }
-        let range_size = u32::from_le_bytes(buf[0..4].try_into().unwrap());
-        let range_offset = u64::from_le_bytes(buf[4..12].try_into().unwrap());
-        let name_len = u32::from_le_bytes(buf[12..16].try_into().unwrap());
-        let name = String::from_utf8_lossy(&buf[16..]).into_owned();
+        let range_size = u32::from_le_bytes(buf[0..4].try_into().ok()?);
+        let range_offset = u64::from_le_bytes(buf[4..12].try_into().ok()?);
+        let name_len = u32::from_le_bytes(buf[12..16].try_into().ok()?);
+        let name_end = HEADER_LEN.checked_add(name_len as usize)?;
+        let name = std::str::from_utf8(buf.get(HEADER_LEN..name_end)?)
+            .ok()?
+            .to_string();
         Some(FileRangeHeader {
             range_size,
             range_offset,
@@ -150,6 +155,26 @@ mod tests {
     #[test]
     fn file_range_header_rejects_short_buffer() {
         assert!(FileRangeHeader::parse(&[0u8; 15]).is_none());
+    }
+
+    #[test]
+    fn file_range_header_rejects_name_longer_than_buffer() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&100u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&8u32.to_le_bytes()); // declares 8 name bytes...
+        buf.extend_from_slice(b"a.ns"); // ...but only 4 follow
+        assert!(FileRangeHeader::parse(&buf).is_none());
+    }
+
+    #[test]
+    fn file_range_header_rejects_invalid_utf8_name() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&100u32.to_le_bytes());
+        buf.extend_from_slice(&0u64.to_le_bytes());
+        buf.extend_from_slice(&2u32.to_le_bytes());
+        buf.extend_from_slice(&[0xff, 0xfe]); // not valid UTF-8
+        assert!(FileRangeHeader::parse(&buf).is_none());
     }
 
     #[test]

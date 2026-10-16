@@ -252,6 +252,7 @@ dependencies = [
  "crossterm",
  "dbi-backend-core",
  "ratatui",
+ "tempfile",
  "tokio",
 ]
 
