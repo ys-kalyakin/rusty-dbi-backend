@@ -25,6 +25,7 @@ impl<T: Transport> Server<T> {
     }
 
     /// Consume the server and return the transport (used by tests).
+    #[doc(hidden)]
     pub fn into_transport(self) -> T {
         self.transport
     }
@@ -37,6 +38,7 @@ impl<T: Transport> Server<T> {
             let header = Header::parse(&bytes)
                 .ok_or_else(|| ServerError::Protocol("short header".into()))?;
             if !header.is_valid() {
+                log("Ignoring unknown framing".into());
                 continue;
             }
             match header.cmd_id {
@@ -69,7 +71,7 @@ impl<T: Transport> Server<T> {
         let resp = Header::new(CMD_TYPE_RESPONSE, CMD_ID_LIST, len).to_bytes();
         self.transport.write(&resp).await?;
         if len > 0 {
-            let _ack = self.transport.read(HEADER_LEN).await?;
+            self.transport.read(HEADER_LEN).await?;
             self.transport.write(&payload).await?;
         }
         Ok(())

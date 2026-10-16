@@ -64,3 +64,27 @@ async fn list_command_sends_file_names_then_exits() {
         Header::new(CMD_TYPE_RESPONSE, CMD_ID_EXIT, 0).to_bytes()
     );
 }
+
+#[tokio::test]
+async fn empty_list_command_writes_zero_length_and_does_not_read_ack() {
+    let files = FileList::new();
+
+    let reads = vec![req(CMD_ID_LIST, 0), req(CMD_ID_EXIT, 0)];
+    let mut server = Server::new(MockTransport::new(reads), files);
+
+    let mut logs = Vec::new();
+    server.run(|line| logs.push(line)).await.unwrap();
+    let transport = server.into_transport();
+
+    assert_eq!(
+        transport.writes[0],
+        Header::new(CMD_TYPE_RESPONSE, CMD_ID_LIST, 0).to_bytes()
+    );
+    assert_eq!(
+        transport.writes[1],
+        Header::new(CMD_TYPE_RESPONSE, CMD_ID_EXIT, 0).to_bytes()
+    );
+    assert!(logs.iter().any(|l| l.contains("Entering command loop")));
+    assert!(logs.iter().any(|l| l.contains("Get list")));
+    assert!(logs.iter().any(|l| l.contains("Exit")));
+}
