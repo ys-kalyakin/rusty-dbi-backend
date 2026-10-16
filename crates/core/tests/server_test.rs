@@ -172,6 +172,21 @@ async fn file_range_with_unknown_file_is_logged_and_skipped() {
 }
 
 #[tokio::test]
+async fn oversized_file_range_header_is_rejected() {
+    let files = FileList::new();
+    let reads = vec![req(CMD_ID_FILE_RANGE, u32::MAX)];
+    let mut server = Server::new(MockTransport::new(reads), files);
+
+    let mut logs = Vec::new();
+    let err = server.run(|line| logs.push(line)).await.unwrap_err();
+    let transport = server.into_transport();
+
+    assert!(err.to_string().contains("too large"), "{err}");
+    assert!(transport.writes.is_empty());
+    assert!(logs.iter().any(|l| l.contains("too large")));
+}
+
+#[tokio::test]
 async fn file_range_larger_than_one_chunk_is_streamed_in_multiple_writes() {
     let total = BUFFER_SEGMENT_DATA_SIZE + 10;
     let content: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();

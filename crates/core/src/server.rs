@@ -13,6 +13,10 @@ pub enum ServerError {
     Protocol(String),
 }
 
+/// Upper bound accepted for a FILE_RANGE request body (16-byte fixed part plus the file
+/// name). Larger sizes are rejected instead of allocating an untrusted amount of memory.
+const MAX_RANGE_HEADER_LEN: usize = 0x4000;
+
 /// Serves DBI requests read from a [`Transport`].
 pub struct Server<T: Transport> {
     transport: T,
@@ -85,6 +89,11 @@ impl<T: Transport> Server<T> {
         use std::io::{Read, Seek, SeekFrom};
 
         log("File range".into());
+
+        if data_size as usize > MAX_RANGE_HEADER_LEN {
+            log(format!("Range header too large: {data_size} bytes"));
+            return Err(ServerError::Protocol("file range header too large".into()));
+        }
 
         let ack = Header::new(CMD_TYPE_ACK, CMD_ID_FILE_RANGE, data_size).to_bytes();
         self.transport.write(&ack).await?;
