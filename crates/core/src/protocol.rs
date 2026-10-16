@@ -69,6 +69,44 @@ impl Header {
     }
 }
 
+/// The payload describing which part of which file the Switch wants.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileRangeHeader {
+    pub range_size: u32,
+    pub range_offset: u64,
+    pub name_len: u32,
+    pub name: String,
+}
+
+impl FileRangeHeader {
+    /// Parse from a buffer holding at least 16 bytes followed by the UTF-8 name.
+    pub fn parse(buf: &[u8]) -> Option<FileRangeHeader> {
+        if buf.len() < HEADER_LEN {
+            return None;
+        }
+        let range_size = u32::from_le_bytes(buf[0..4].try_into().unwrap());
+        let range_offset = u64::from_le_bytes(buf[4..12].try_into().unwrap());
+        let name_len = u32::from_le_bytes(buf[12..16].try_into().unwrap());
+        let name = String::from_utf8_lossy(&buf[16..]).into_owned();
+        Some(FileRangeHeader {
+            range_size,
+            range_offset,
+            name_len,
+            name,
+        })
+    }
+}
+
+/// Build the LIST payload: each name followed by a newline, UTF-8 encoded.
+pub fn build_list(names: impl IntoIterator<Item = String>) -> Vec<u8> {
+    let mut out = String::new();
+    for name in names {
+        out.push_str(&name);
+        out.push('\n');
+    }
+    out.into_bytes()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -93,5 +131,31 @@ mod tests {
     #[test]
     fn header_parse_rejects_short_buffer() {
         assert!(Header::parse(&[0u8; 15]).is_none());
+    }
+
+    #[test]
+    fn file_range_header_parses_fields() {
+        let mut buf = Vec::new();
+        buf.extend_from_slice(&100u32.to_le_bytes());
+        buf.extend_from_slice(&0x1000u64.to_le_bytes());
+        buf.extend_from_slice(&4u32.to_le_bytes());
+        buf.extend_from_slice(b"a.ns");
+        let fr = FileRangeHeader::parse(&buf).unwrap();
+        assert_eq!(fr.range_size, 100);
+        assert_eq!(fr.range_offset, 0x1000);
+        assert_eq!(fr.name_len, 4);
+        assert_eq!(fr.name, "a.ns");
+    }
+
+    #[test]
+    fn file_range_header_rejects_short_buffer() {
+        assert!(FileRangeHeader::parse(&[0u8; 15]).is_none());
+    }
+
+    #[test]
+    fn list_payload_terminates_each_name() {
+        let names = vec!["a.nsp".to_string(), "b.nsp".to_string()];
+        let payload = build_list(names);
+        assert_eq!(payload, b"a.nsp\nb.nsp\n");
     }
 }
