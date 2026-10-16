@@ -155,6 +155,56 @@ async fn file_range_with_unknown_file_is_logged_and_skipped() {
     server.run(|line| logs.push(line)).await.unwrap();
     let transport = server.into_transport();
 
-    assert!(transport.writes.iter().any(|w| w.starts_with(b"DBI0")));
+    assert_eq!(transport.writes.len(), 3);
+    assert_eq!(
+        transport.writes[0],
+        Header::new(CMD_TYPE_ACK, CMD_ID_FILE_RANGE, data_size).to_bytes()
+    );
+    assert_eq!(
+        transport.writes[1],
+        Header::new(CMD_TYPE_RESPONSE, CMD_ID_FILE_RANGE, 5).to_bytes()
+    );
+    assert_eq!(
+        transport.writes[2],
+        Header::new(CMD_TYPE_RESPONSE, CMD_ID_EXIT, 0).to_bytes()
+    );
     assert!(logs.iter().any(|l| l.contains("missing.nsp")));
+}
+
+#[tokio::test]
+async fn file_range_larger_than_one_chunk_is_streamed_in_multiple_writes() {
+    let total = BUFFER_SEGMENT_DATA_SIZE + 10;
+    let content: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.nsp");
+    std::fs::write(&path, &content).unwrap();
+
+    let name = "big.nsp";
+    let mut files = FileList::new();
+    files.insert(name, &path);
+
+    let mut range_header = Vec::new();
+    range_header.extend_from_slice(&(total as u32).to_le_bytes());
+    range_header.extend_from_slice(&0u64.to_le_bytes());
+    range_header.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    range_header.extend_from_slice(name.as_bytes());
+    let data_size = range_header.len() as u32;
+
+    let reads = vec![
+        req(CMD_ID_FILE_RANGE, data_size),
+        range_header,
+        ack(),
+        req(CMD_ID_EXIT, 0),
+    ];
+    let mut server = Server::new(MockTransport::new(reads), files);
+    server.run(|_line| {}).await.unwrap();
+    let transport = server.into_transport();
+
+    // writes[0] = ACK, writes[1] = RESPONSE, writes[2..4] = two data chunks, writes[4] = EXIT.
+    assert_eq!(transport.writes.len(), 5);
+    assert_eq!(transport.writes[2].len(), BUFFER_SEGMENT_DATA_SIZE);
+    assert_eq!(transport.writes[3].len(), 10);
+    assert_eq!(transport.writes[2], &content[..BUFFER_SEGMENT_DATA_SIZE]);
+    assert_eq!(transport.writes[3], &content[BUFFER_SEGMENT_DATA_SIZE..]);
 }

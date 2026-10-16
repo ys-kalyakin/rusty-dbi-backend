@@ -121,13 +121,24 @@ impl<T: Transport> Server<T> {
         }
 
         let mut remaining = range.range_size as usize;
-        let mut buffer = vec![0u8; BUFFER_SEGMENT_DATA_SIZE];
+        let mut buffer = vec![0u8; remaining.min(BUFFER_SEGMENT_DATA_SIZE)];
         while remaining > 0 {
             let to_read = remaining.min(BUFFER_SEGMENT_DATA_SIZE);
-            let n = file
-                .read(&mut buffer[..to_read])
-                .map_err(|e| ServerError::Protocol(format!("read failed: {e}")))?;
+            let n = match file.read(&mut buffer[..to_read]) {
+                Ok(n) => n,
+                Err(e) => {
+                    log(format!("Read failed for {}: {e}", path.display()));
+                    break;
+                }
+            };
             if n == 0 {
+                if remaining > 0 {
+                    log(format!(
+                        "Short transfer for {}: {} bytes remaining",
+                        path.display(),
+                        remaining
+                    ));
+                }
                 break;
             }
             self.transport.write(&buffer[..n]).await?;
