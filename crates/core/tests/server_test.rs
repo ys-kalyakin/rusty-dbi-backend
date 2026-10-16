@@ -1,7 +1,7 @@
 use async_trait::async_trait;
 use dbi_backend_core::filelist::FileList;
 use dbi_backend_core::protocol::*;
-use dbi_backend_core::server::{Server, ServerError};
+use dbi_backend_core::server::{Server, ServerError, ServerUpdate};
 use dbi_backend_core::transport::{Transport, TransportError};
 use std::collections::VecDeque;
 
@@ -73,7 +73,14 @@ async fn empty_list_command_writes_zero_length_and_does_not_read_ack() {
     let mut server = Server::new(MockTransport::new(reads), files);
 
     let mut logs = Vec::new();
-    server.run(|line| logs.push(line)).await.unwrap();
+    server
+        .run(|update| {
+            if let ServerUpdate::Log(line) = update {
+                logs.push(line);
+            }
+        })
+        .await
+        .unwrap();
     let transport = server.into_transport();
 
     assert_eq!(
@@ -147,7 +154,14 @@ async fn file_range_with_unknown_file_ends_the_run() {
     let mut server = Server::new(MockTransport::new(reads), files);
 
     let mut logs = Vec::new();
-    let err = server.run(|line| logs.push(line)).await.unwrap_err();
+    let err = server
+        .run(|update| {
+            if let ServerUpdate::Log(line) = update {
+                logs.push(line);
+            }
+        })
+        .await
+        .unwrap_err();
     let transport = server.into_transport();
 
     assert!(matches!(err, ServerError::Range(_)), "{err}");
@@ -180,7 +194,14 @@ async fn unopenable_file_ends_the_run() {
     let mut server = Server::new(MockTransport::new(reads), files);
 
     let mut logs = Vec::new();
-    let err = server.run(|line| logs.push(line)).await.unwrap_err();
+    let err = server
+        .run(|update| {
+            if let ServerUpdate::Log(line) = update {
+                logs.push(line);
+            }
+        })
+        .await
+        .unwrap_err();
 
     assert!(matches!(err, ServerError::Range(_)), "{err}");
     assert!(logs.iter().any(|l| l.contains("Failed to open")));
@@ -208,7 +229,14 @@ async fn short_read_ends_the_run() {
     let mut server = Server::new(MockTransport::new(reads), files);
 
     let mut logs = Vec::new();
-    let err = server.run(|line| logs.push(line)).await.unwrap_err();
+    let err = server
+        .run(|update| {
+            if let ServerUpdate::Log(line) = update {
+                logs.push(line);
+            }
+        })
+        .await
+        .unwrap_err();
     let transport = server.into_transport();
 
     assert!(matches!(err, ServerError::Range(_)), "{err}");
@@ -225,7 +253,14 @@ async fn oversized_file_range_header_is_rejected() {
     let mut server = Server::new(MockTransport::new(reads), files);
 
     let mut logs = Vec::new();
-    let err = server.run(|line| logs.push(line)).await.unwrap_err();
+    let err = server
+        .run(|update| {
+            if let ServerUpdate::Log(line) = update {
+                logs.push(line);
+            }
+        })
+        .await
+        .unwrap_err();
     let transport = server.into_transport();
 
     assert!(err.to_string().contains("too large"), "{err}");
@@ -269,4 +304,55 @@ async fn file_range_larger_than_one_chunk_is_streamed_in_multiple_writes() {
     assert_eq!(transport.writes[3].len(), 10);
     assert_eq!(transport.writes[2], &content[..BUFFER_SEGMENT_DATA_SIZE]);
     assert_eq!(transport.writes[3], &content[BUFFER_SEGMENT_DATA_SIZE..]);
+}
+
+#[tokio::test]
+async fn file_range_reports_throttled_progress() {
+    let size = BUFFER_SEGMENT_DATA_SIZE + 10;
+    let content: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("big.nsp");
+    std::fs::write(&path, &content).unwrap();
+
+    let name = "big.nsp";
+    let mut files = FileList::new();
+    files.insert(name, &path);
+
+    let mut range_header = Vec::new();
+    range_header.extend_from_slice(&(size as u32).to_le_bytes());
+    range_header.extend_from_slice(&0u64.to_le_bytes());
+    range_header.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    range_header.extend_from_slice(name.as_bytes());
+    let data_size = range_header.len() as u32;
+
+    let reads = vec![
+        req(CMD_ID_FILE_RANGE, data_size),
+        range_header,
+        ack(),
+        req(CMD_ID_EXIT, 0),
+    ];
+    let mut server = Server::new(MockTransport::new(reads), files);
+
+    let mut progress = Vec::new();
+    server
+        .run(|update| {
+            if let ServerUpdate::Progress { name, sent, total } = update {
+                progress.push((name, sent, total));
+            }
+        })
+        .await
+        .unwrap();
+
+    // Throttled to percent changes: two chunks yield at most two reports.
+    assert!(!progress.is_empty());
+    assert!(
+        progress.len() <= 2,
+        "too many progress reports: {progress:?}"
+    );
+    assert!(progress.windows(2).all(|w| w[0].1 <= w[1].1));
+    let last = progress.last().unwrap();
+    assert_eq!(last.0, "big.nsp");
+    assert_eq!(last.1, size as u64);
+    assert_eq!(last.2, size as u64);
 }

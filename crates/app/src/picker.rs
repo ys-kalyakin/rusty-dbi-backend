@@ -17,11 +17,15 @@ pub struct Entry {
     pub kind: Kind,
 }
 
-/// Browsing state: the displayed directory, its entries, and the highlight.
+/// Browsing state: the displayed directory, its full listing, the filtered view,
+/// an optional filter string, and the highlight.
 #[derive(Debug)]
 pub struct Picker {
     dir: PathBuf,
-    entries: Vec<Entry>,
+    all: Vec<Entry>,
+    visible: Vec<Entry>,
+    filter: String,
+    filtering: bool,
     cursor: usize,
     error: Option<String>,
 }
@@ -34,7 +38,10 @@ impl Picker {
             Err(e) => {
                 let mut picker = Self {
                     dir: PathBuf::from("."),
-                    entries: Vec::new(),
+                    all: Vec::new(),
+                    visible: Vec::new(),
+                    filter: String::new(),
+                    filtering: false,
                     cursor: 0,
                     error: None,
                 };
@@ -48,7 +55,10 @@ impl Picker {
     pub fn at(dir: impl Into<PathBuf>) -> Self {
         let mut picker = Self {
             dir: dir.into(),
-            entries: Vec::new(),
+            all: Vec::new(),
+            visible: Vec::new(),
+            filter: String::new(),
+            filtering: false,
             cursor: 0,
             error: None,
         };
@@ -57,14 +67,14 @@ impl Picker {
     }
 
     fn reload(&mut self) {
-        self.entries.clear();
-        self.cursor = 0;
+        self.all.clear();
         self.error = None;
 
         let read_dir = match std::fs::read_dir(&self.dir) {
             Ok(read_dir) => read_dir,
             Err(e) => {
                 self.error = Some(format!("{}: {e}", self.dir.display()));
+                self.apply_filter();
                 return;
             }
         };
@@ -75,26 +85,44 @@ impl Picker {
             let Some(kind) = classify(&path, entry.file_type()) else {
                 continue;
             };
-            self.entries.push(Entry {
+            self.all.push(Entry {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 path,
                 kind,
             });
         }
 
-        self.entries.sort_by(|a, b| {
+        self.all.sort_by(|a, b| {
             kind_rank(a.kind)
                 .cmp(&kind_rank(b.kind))
                 .then_with(|| a.name.to_lowercase().cmp(&b.name.to_lowercase()))
         });
+
+        self.apply_filter();
+    }
+
+    /// Recompute the visible view from the full listing and reset the highlight.
+    fn apply_filter(&mut self) {
+        let needle = self.filter.to_lowercase();
+        self.visible = if needle.is_empty() {
+            self.all.clone()
+        } else {
+            self.all
+                .iter()
+                .filter(|entry| entry.name.to_lowercase().contains(&needle))
+                .cloned()
+                .collect()
+        };
+        self.cursor = 0;
     }
 
     pub fn dir(&self) -> &Path {
         &self.dir
     }
 
+    /// The entries currently shown (the full listing when no filter is set).
     pub fn entries(&self) -> &[Entry] {
-        &self.entries
+        &self.visible
     }
 
     pub fn cursor(&self) -> usize {
@@ -105,9 +133,40 @@ impl Picker {
         self.error.as_deref()
     }
 
+    pub fn filter(&self) -> &str {
+        &self.filter
+    }
+
+    pub fn is_filtering(&self) -> bool {
+        self.filtering
+    }
+
+    pub fn start_filter(&mut self) {
+        self.filtering = true;
+    }
+
+    pub fn stop_filter(&mut self) {
+        self.filtering = false;
+    }
+
+    pub fn push_filter(&mut self, c: char) {
+        self.filter.push(c);
+        self.apply_filter();
+    }
+
+    pub fn pop_filter(&mut self) {
+        self.filter.pop();
+        self.apply_filter();
+    }
+
+    pub fn clear_filter(&mut self) {
+        self.filter.clear();
+        self.apply_filter();
+    }
+
     /// The entry under the highlight, or `None` for an empty listing.
     pub fn current(&self) -> Option<&Entry> {
-        self.entries.get(self.cursor)
+        self.visible.get(self.cursor)
     }
 
     pub fn move_up(&mut self) {
@@ -115,7 +174,7 @@ impl Picker {
     }
 
     pub fn move_down(&mut self) {
-        if self.cursor + 1 < self.entries.len() {
+        if self.cursor + 1 < self.visible.len() {
             self.cursor += 1;
         }
     }
@@ -171,6 +230,13 @@ mod tests {
 
     fn names(picker: &Picker) -> Vec<&str> {
         picker.entries().iter().map(|e| e.name.as_str()).collect()
+    }
+
+    fn filter_with(picker: &mut Picker, text: &str) {
+        picker.start_filter();
+        for c in text.chars() {
+            picker.push_filter(c);
+        }
     }
 
     #[test]
@@ -269,5 +335,55 @@ mod tests {
         assert!(picker.entries().is_empty());
         assert!(picker.error().is_some());
         assert_eq!(picker.current(), None);
+    }
+
+    #[test]
+    fn filter_narrows_the_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("alpha.nsp"), b"a").unwrap();
+        fs::write(dir.path().join("beta.nsp"), b"b").unwrap();
+
+        let mut picker = Picker::at(dir.path());
+        filter_with(&mut picker, "BETA");
+        assert_eq!(names(&picker), vec!["beta.nsp"]);
+        assert_eq!(picker.cursor(), 0);
+    }
+
+    #[test]
+    fn filter_with_no_matches_empties_the_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("alpha.nsp"), b"a").unwrap();
+
+        let mut picker = Picker::at(dir.path());
+        filter_with(&mut picker, "zzz");
+        assert!(picker.entries().is_empty());
+        assert_eq!(picker.current(), None);
+    }
+
+    #[test]
+    fn clearing_the_filter_restores_the_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("alpha.nsp"), b"a").unwrap();
+        fs::write(dir.path().join("beta.nsp"), b"b").unwrap();
+
+        let mut picker = Picker::at(dir.path());
+        filter_with(&mut picker, "beta");
+        assert_eq!(picker.entries().len(), 1);
+        picker.clear_filter();
+        assert_eq!(picker.entries().len(), 2);
+    }
+
+    #[test]
+    fn move_down_clamps_within_the_filtered_listing() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("alpha.nsp"), b"a").unwrap();
+        fs::write(dir.path().join("beta.nsp"), b"b").unwrap();
+
+        let mut picker = Picker::at(dir.path());
+        filter_with(&mut picker, "a.nsp");
+        assert_eq!(picker.entries().len(), 2);
+        picker.move_down();
+        picker.move_down();
+        assert_eq!(picker.cursor(), 1);
     }
 }

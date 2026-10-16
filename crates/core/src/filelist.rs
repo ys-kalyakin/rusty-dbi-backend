@@ -3,10 +3,17 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// Name-to-path map. A `BTreeMap` keeps the listing deterministic (sorted by name).
+/// A single offered file: its resolved path and size in bytes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileEntry {
+    pub path: PathBuf,
+    pub size: u64,
+}
+
+/// Name-to-entry map. A `BTreeMap` keeps the listing deterministic (sorted by name).
 #[derive(Debug, Default, Clone)]
 pub struct FileList {
-    files: BTreeMap<String, PathBuf>,
+    files: BTreeMap<String, FileEntry>,
 }
 
 /// What an [`FileList::add_path`] call did, so callers can report warnings.
@@ -27,7 +34,11 @@ impl FileList {
 
     /// Insert an entry by name, returning the path it replaced, if any.
     pub fn insert(&mut self, name: impl Into<String>, path: impl Into<PathBuf>) -> Option<PathBuf> {
-        self.files.insert(name.into(), path.into())
+        let path = path.into();
+        let size = file_size(&path);
+        self.files
+            .insert(name.into(), FileEntry { path, size })
+            .map(|entry| entry.path)
     }
 
     /// Add a file, or every `.nsp`/`.nsz` file found recursively under a directory.
@@ -98,7 +109,12 @@ impl FileList {
         let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
         if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
             let name = name.to_string();
-            if self.files.insert(name.clone(), abs).is_some() {
+            let size = file_size(&abs);
+            if self
+                .files
+                .insert(name.clone(), FileEntry { path: abs, size })
+                .is_some()
+            {
                 outcome.replaced.push(name.clone());
             }
             outcome.added.push(name);
@@ -109,6 +125,11 @@ impl FileList {
         self.files.clear();
     }
 
+    /// Remove an entry by name, returning it if it was present.
+    pub fn remove(&mut self, name: &str) -> Option<FileEntry> {
+        self.files.remove(name)
+    }
+
     pub fn is_empty(&self) -> bool {
         self.files.is_empty()
     }
@@ -117,7 +138,12 @@ impl FileList {
         self.files.len()
     }
 
-    pub fn get(&self, name: &str) -> Option<&PathBuf> {
+    /// Sum of every entry's size in bytes.
+    pub fn total_size(&self) -> u64 {
+        self.files.values().map(|entry| entry.size).sum()
+    }
+
+    pub fn get(&self, name: &str) -> Option<&FileEntry> {
         self.files.get(name)
     }
 
@@ -125,9 +151,14 @@ impl FileList {
         self.files.keys()
     }
 
-    pub fn iter(&self) -> impl Iterator<Item = (&String, &PathBuf)> {
+    pub fn iter(&self) -> impl Iterator<Item = (&String, &FileEntry)> {
         self.files.iter()
     }
+}
+
+/// Read a path's size in bytes, tolerating unreadable metadata with `0`.
+fn file_size(path: &Path) -> u64 {
+    std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
 
 /// Whether the path's extension is one of the Switch title formats, case-insensitively.
@@ -220,7 +251,7 @@ mod tests {
         list.insert("a", "/1");
         list.insert("a", "/2");
         assert_eq!(list.len(), 1);
-        assert_eq!(list.get("a").unwrap(), &PathBuf::from("/2"));
+        assert_eq!(list.get("a").unwrap().path, PathBuf::from("/2"));
     }
 
     #[test]
@@ -255,6 +286,46 @@ mod tests {
 
         assert_eq!(outcome.added, vec!["a.nsp".to_string()]);
         assert!(outcome.skipped.is_empty());
+    }
+
+    #[test]
+    fn add_file_records_size() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("x.nsp");
+        fs::write(&f, b"12345").unwrap();
+        let mut list = FileList::new();
+        list.add_path(&f).unwrap();
+        assert_eq!(list.get("x.nsp").unwrap().size, 5);
+    }
+
+    #[test]
+    fn recorded_size_survives_the_file_being_removed() {
+        let dir = tempfile::tempdir().unwrap();
+        let f = dir.path().join("x.nsp");
+        fs::write(&f, b"1234567").unwrap();
+        let mut list = FileList::new();
+        list.add_path(&f).unwrap();
+        fs::remove_file(&f).unwrap();
+        assert_eq!(list.get("x.nsp").unwrap().size, 7);
+    }
+
+    #[test]
+    fn total_size_sums_entries() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.nsp"), b"abc").unwrap();
+        fs::write(dir.path().join("b.nsp"), b"defg").unwrap();
+        let mut list = FileList::new();
+        list.add_path(dir.path()).unwrap();
+        assert_eq!(list.total_size(), 7);
+    }
+
+    #[test]
+    fn remove_drops_an_entry() {
+        let mut list = FileList::new();
+        list.insert("a", "/1");
+        assert!(list.remove("a").is_some());
+        assert!(list.is_empty());
+        assert!(list.remove("a").is_none());
     }
 
     #[cfg(unix)]
