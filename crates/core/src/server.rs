@@ -77,12 +77,62 @@ impl<T: Transport> Server<T> {
         Ok(())
     }
 
-    // Implemented in Task 6.
     async fn process_file_range<F: FnMut(String)>(
         &mut self,
-        _data_size: u32,
-        _log: &mut F,
+        data_size: u32,
+        log: &mut F,
     ) -> Result<(), ServerError> {
+        use std::io::{Read, Seek, SeekFrom};
+
+        log("File range".into());
+
+        let ack = Header::new(CMD_TYPE_ACK, CMD_ID_FILE_RANGE, data_size).to_bytes();
+        self.transport.write(&ack).await?;
+
+        let range_bytes = self.transport.read(data_size as usize).await?;
+        let range = FileRangeHeader::parse(&range_bytes)
+            .ok_or_else(|| ServerError::Protocol("short file range header".into()))?;
+
+        log(format!(
+            "Range Size: {}, Range Offset: {}, Name len: {}, Name: {}",
+            range.range_size, range.range_offset, range.name_len, range.name
+        ));
+
+        let resp = Header::new(CMD_TYPE_RESPONSE, CMD_ID_FILE_RANGE, range.range_size).to_bytes();
+        self.transport.write(&resp).await?;
+
+        self.transport.read(HEADER_LEN).await?;
+
+        let Some(path) = self.files.get(&range.name).cloned() else {
+            log(format!("Unknown file: {}", range.name));
+            return Ok(());
+        };
+
+        let mut file = match std::fs::File::open(&path) {
+            Ok(f) => f,
+            Err(e) => {
+                log(format!("Failed to open {}: {e}", path.display()));
+                return Ok(());
+            }
+        };
+        if let Err(e) = file.seek(SeekFrom::Start(range.range_offset)) {
+            log(format!("Failed to seek {}: {e}", path.display()));
+            return Ok(());
+        }
+
+        let mut remaining = range.range_size as usize;
+        let mut buffer = vec![0u8; BUFFER_SEGMENT_DATA_SIZE];
+        while remaining > 0 {
+            let to_read = remaining.min(BUFFER_SEGMENT_DATA_SIZE);
+            let n = file
+                .read(&mut buffer[..to_read])
+                .map_err(|e| ServerError::Protocol(format!("read failed: {e}")))?;
+            if n == 0 {
+                break;
+            }
+            self.transport.write(&buffer[..n]).await?;
+            remaining -= n;
+        }
         Ok(())
     }
 }

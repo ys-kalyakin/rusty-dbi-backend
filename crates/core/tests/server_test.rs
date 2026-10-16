@@ -88,3 +88,73 @@ async fn empty_list_command_writes_zero_length_and_does_not_read_ack() {
     assert!(logs.iter().any(|l| l.contains("Get list")));
     assert!(logs.iter().any(|l| l.contains("Exit")));
 }
+
+#[tokio::test]
+async fn file_range_command_streams_requested_bytes() {
+    let dir = tempfile::tempdir().unwrap();
+    let path = dir.path().join("game.nsp");
+    std::fs::write(&path, [0u8, 1, 2, 3, 4, 5, 6, 7, 8, 9]).unwrap();
+
+    let name = "game.nsp";
+    let mut files = FileList::new();
+    files.insert(name, &path);
+
+    let mut range_header = Vec::new();
+    range_header.extend_from_slice(&5u32.to_le_bytes()); // range_size
+    range_header.extend_from_slice(&2u64.to_le_bytes()); // range_offset
+    range_header.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    range_header.extend_from_slice(name.as_bytes());
+    let data_size = range_header.len() as u32;
+
+    let reads = vec![
+        req(CMD_ID_FILE_RANGE, data_size),
+        range_header,
+        ack(),
+        req(CMD_ID_EXIT, 0),
+    ];
+    let mut server = Server::new(MockTransport::new(reads), files);
+
+    server.run(|_line| {}).await.unwrap();
+    let transport = server.into_transport();
+
+    assert_eq!(
+        transport.writes[0],
+        Header::new(CMD_TYPE_ACK, CMD_ID_FILE_RANGE, data_size).to_bytes()
+    );
+    assert_eq!(
+        transport.writes[1],
+        Header::new(CMD_TYPE_RESPONSE, CMD_ID_FILE_RANGE, 5).to_bytes()
+    );
+    assert_eq!(transport.writes[2], vec![2u8, 3, 4, 5, 6]);
+    assert_eq!(
+        transport.writes[3],
+        Header::new(CMD_TYPE_RESPONSE, CMD_ID_EXIT, 0).to_bytes()
+    );
+}
+
+#[tokio::test]
+async fn file_range_with_unknown_file_is_logged_and_skipped() {
+    let name = "missing.nsp";
+    let mut range_header = Vec::new();
+    range_header.extend_from_slice(&5u32.to_le_bytes());
+    range_header.extend_from_slice(&0u64.to_le_bytes());
+    range_header.extend_from_slice(&(name.len() as u32).to_le_bytes());
+    range_header.extend_from_slice(name.as_bytes());
+    let data_size = range_header.len() as u32;
+
+    let reads = vec![
+        req(CMD_ID_FILE_RANGE, data_size),
+        range_header,
+        ack(),
+        req(CMD_ID_EXIT, 0),
+    ];
+    let files = FileList::new();
+    let mut server = Server::new(MockTransport::new(reads), files);
+
+    let mut logs = Vec::new();
+    server.run(|line| logs.push(line)).await.unwrap();
+    let transport = server.into_transport();
+
+    assert!(transport.writes.iter().any(|w| w.starts_with(b"DBI0")));
+    assert!(logs.iter().any(|l| l.contains("missing.nsp")));
+}
