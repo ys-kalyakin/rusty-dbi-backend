@@ -28,7 +28,12 @@ pub struct Header {
 impl Header {
     /// Build a header using the DBI0 magic.
     pub fn new(cmd_type: u32, cmd_id: u32, data_size: u32) -> Self {
-        Self { magic: MAGIC, cmd_type, cmd_id, data_size }
+        Self {
+            magic: MAGIC,
+            cmd_type,
+            cmd_id,
+            data_size,
+        }
     }
 
     /// Serialize to the 16-byte little-endian wire form.
@@ -50,7 +55,12 @@ impl Header {
         let cmd_type = u32::from_le_bytes(buf[4..8].try_into().unwrap());
         let cmd_id = u32::from_le_bytes(buf[8..12].try_into().unwrap());
         let data_size = u32::from_le_bytes(buf[12..16].try_into().unwrap());
-        Some(Header { magic, cmd_type, cmd_id, data_size })
+        Some(Header {
+            magic,
+            cmd_type,
+            cmd_id,
+            data_size,
+        })
     }
 
     /// Whether this header starts with the DBI0 magic.
