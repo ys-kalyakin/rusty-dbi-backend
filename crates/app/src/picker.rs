@@ -15,6 +15,8 @@ pub struct Entry {
     pub name: String,
     pub path: PathBuf,
     pub kind: Kind,
+    /// Regular files carry a size; directories do not.
+    pub size: Option<u64>,
 }
 
 /// Browsing state: the displayed directory, its full listing, the filtered view,
@@ -65,7 +67,6 @@ impl Picker {
         picker.reload();
         picker
     }
-
     fn reload(&mut self) {
         self.all.clear();
         self.error = None;
@@ -85,10 +86,16 @@ impl Picker {
             let Some(kind) = classify(&path, entry.file_type()) else {
                 continue;
             };
+            let size = if kind == Kind::File {
+                std::fs::metadata(&path).map(|meta| meta.len()).ok()
+            } else {
+                None
+            };
             self.all.push(Entry {
                 name: entry.file_name().to_string_lossy().into_owned(),
                 path,
                 kind,
+                size,
             });
         }
 

@@ -5,23 +5,31 @@ use std::path::{Path, PathBuf};
 use std::time::{Duration, Instant};
 
 use crate::picker::{Kind, Picker};
+use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
 use dbi_backend_core::filelist::FileList;
 use dbi_backend_core::server::{Server, ServerUpdate};
 use dbi_backend_core::transport::usb::UsbTransport;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
-use ratatui::style::{Color, Style};
-use ratatui::text::Line;
-use ratatui::widgets::{Block, Borders, Clear, Gauge, List, ListItem, ListState, Paragraph, Wrap};
+use ratatui::style::{Color, Modifier, Style};
+use ratatui::text::{Line, Span};
+use ratatui::widgets::{Cell, Clear, Gauge, Paragraph, Row, Table, TableState, Wrap};
 use ratatui::Frame;
 use tokio::sync::mpsc::UnboundedSender;
 
 /// Maximum number of log lines retained (mirrors the Python 1000-line cap).
 pub const MAX_LOG_LINES: usize = 1000;
 
+/// Ignore samples closer together than this when estimating transfer speed.
+const MIN_SPEED_SAMPLE_INTERVAL: Duration = Duration::from_millis(100);
+
+/// Time constant for exponentially smoothing the reported transfer speed.
+const SPEED_SMOOTHING_TAU_SECS: f64 = 2.0;
+
 #[derive(Clone, Copy, PartialEq, Eq, Debug)]
 pub enum ServerStatus {
     Idle,
+    Waiting,
     Running,
 }
 
@@ -37,8 +45,18 @@ pub enum Action {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum ServerEvent {
     Started,
+    Disconnected,
     Ended,
-    Progress { name: String, sent: u64, total: u64 },
+    Progress {
+        name: String,
+        sent: u64,
+        total: u64,
+    },
+    /// A file range was streamed in full; the progress region ends with it.
+    Completed {
+        name: String,
+        bytes: u64,
+    },
 }
 
 /// Which destructive action a confirmation prompt is gating.
@@ -70,7 +88,12 @@ pub struct ProgressState {
     pub sent: u64,
     pub total: u64,
     pub speed: Option<u64>,
-    last_at: Instant,
+    /// Estimated seconds remaining, derivable once a transfer speed is known.
+    pub eta: Option<u64>,
+    /// Timestamp and byte count of the last sample accepted by the rate estimator.
+    speed_sample_at: Instant,
+    speed_sample_sent: u64,
+    smoothed_speed: Option<f64>,
 }
 
 pub struct App {
@@ -111,7 +134,15 @@ impl App {
     /// Apply a lifecycle or progress transition from the background server task.
     pub fn handle_server_event(&mut self, event: ServerEvent) {
         match event {
-            ServerEvent::Started => self.status = ServerStatus::Running,
+            ServerEvent::Started => {
+                self.status = ServerStatus::Running;
+                // Progress belongs to a live connection; never revive an old bar.
+                self.progress = None;
+            }
+            ServerEvent::Disconnected => {
+                self.status = ServerStatus::Waiting;
+                self.progress = None;
+            }
             ServerEvent::Ended => {
                 self.status = ServerStatus::Idle;
                 self.server_started = false;
@@ -120,30 +151,83 @@ impl App {
             ServerEvent::Progress { name, sent, total } => {
                 self.update_progress(name, sent, total);
             }
+            ServerEvent::Completed { name, bytes } => {
+                self.progress = None;
+                self.push_log(format!("Sent: {name} ({})", human_size(bytes)));
+            }
         }
     }
 
     fn update_progress(&mut self, name: String, sent: u64, total: u64) {
-        let now = Instant::now();
-        let speed = match &self.progress {
-            Some(previous) if previous.name == name && sent > previous.sent => {
-                let elapsed = now.duration_since(previous.last_at).as_secs_f64();
-                if elapsed > 0.0 {
-                    Some(((sent - previous.sent) as f64 / elapsed) as u64)
-                } else {
-                    previous.speed
-                }
-            }
-            Some(previous) if previous.name == name => previous.speed,
-            _ => None,
+        self.update_progress_at(name, sent, total, Instant::now());
+    }
+
+    fn update_progress_at(&mut self, name: String, sent: u64, total: u64, now: Instant) {
+        let Some(previous) = self.progress.as_ref().filter(|state| state.name == name) else {
+            self.progress = Some(ProgressState {
+                name,
+                sent,
+                total,
+                speed: None,
+                eta: None,
+                speed_sample_at: now,
+                speed_sample_sent: sent,
+                smoothed_speed: None,
+            });
+            return;
         };
-        self.progress = Some(ProgressState {
+
+        // A sample that moves the bar backward starts a new streamed phase: the
+        // region follows it at the new position, and the previous phase's speed
+        // and estimate history is discarded so nothing continues across the
+        // restart.
+        if sent < previous.sent {
+            self.progress = Some(ProgressState {
+                name,
+                sent,
+                total,
+                speed: None,
+                eta: None,
+                speed_sample_at: now,
+                speed_sample_sent: sent,
+                smoothed_speed: None,
+            });
+            return;
+        }
+
+        let mut next = ProgressState {
             name,
             sent,
             total,
-            speed,
-            last_at: now,
-        });
+            speed: previous.speed,
+            eta: previous.eta,
+            speed_sample_at: previous.speed_sample_at,
+            speed_sample_sent: previous.speed_sample_sent,
+            smoothed_speed: previous.smoothed_speed,
+        };
+
+        if sent > previous.speed_sample_sent {
+            let elapsed = now.saturating_duration_since(previous.speed_sample_at);
+            if elapsed >= MIN_SPEED_SAMPLE_INTERVAL {
+                let elapsed_secs = elapsed.as_secs_f64();
+                let instant = (sent - previous.speed_sample_sent) as f64 / elapsed_secs;
+                let smoothed = match previous.smoothed_speed {
+                    Some(previous_speed) => {
+                        let alpha = 1.0 - (-elapsed_secs / SPEED_SMOOTHING_TAU_SECS).exp();
+                        previous_speed + alpha * (instant - previous_speed)
+                    }
+                    None => instant,
+                };
+                let speed = smoothed.round() as u64;
+                next.speed = Some(speed);
+                next.eta = Some(remaining_seconds(sent, total, speed));
+                next.speed_sample_at = now;
+                next.speed_sample_sent = sent;
+                next.smoothed_speed = Some(smoothed);
+            }
+        }
+
+        self.progress = Some(next);
     }
 
     /// Add a path to the file list, logging the outcome and closing the picker.
@@ -334,7 +418,9 @@ impl App {
             Mode::Normal => {}
         }
 
-        let running = self.status == ServerStatus::Running;
+        // While the server task is active (waiting or running), edits are inert so
+        // the offered list matches the server's snapshot.
+        let running = self.server_started;
         match key.code {
             KeyCode::Char('q') => {
                 self.mode = Mode::Confirm(ConfirmKind::Quit);
@@ -377,7 +463,7 @@ impl App {
             KeyCode::Char('s') => {
                 if !self.server_started && !self.files.is_empty() {
                     self.server_started = true;
-                    self.status = ServerStatus::Running;
+                    self.status = ServerStatus::Waiting;
                     Action::Start
                 } else {
                     Action::None
@@ -385,6 +471,45 @@ impl App {
             }
             _ => Action::None,
         }
+    }
+}
+
+/// Decides which connection attempts reach the log.
+///
+/// The waiting state is logged once per waiting period, and a failing connection is
+/// logged once while the same error persists.
+#[derive(Debug, Default)]
+struct ConnectLog {
+    waiting_logged: bool,
+    last_error: Option<String>,
+}
+
+impl ConnectLog {
+    /// The message to log before a connection attempt, if the waiting state is new.
+    fn waiting(&mut self) -> Option<&'static str> {
+        if self.waiting_logged {
+            None
+        } else {
+            self.waiting_logged = true;
+            Some("Waiting for Switch...")
+        }
+    }
+
+    /// The message to log for a failed attempt, if the error differs from the last one.
+    fn failed(&mut self, error: &str) -> Option<String> {
+        let message = format!("USB error: {error}");
+        if self.last_error.as_deref() == Some(message.as_str()) {
+            None
+        } else {
+            self.last_error = Some(message.clone());
+            Some(message)
+        }
+    }
+
+    /// Forget the waiting state and the last error once a connection is established.
+    fn connected(&mut self) {
+        self.waiting_logged = false;
+        self.last_error = None;
     }
 }
 
@@ -396,16 +521,22 @@ pub fn spawn_server(
     event_tx: UnboundedSender<ServerEvent>,
 ) {
     tokio::spawn(async move {
+        let mut connect_log = ConnectLog::default();
         loop {
-            let _ = log_tx.send("Waiting for Switch...".into());
+            if let Some(message) = connect_log.waiting() {
+                let _ = log_tx.send(message.into());
+            }
             let transport = match UsbTransport::connect().await {
                 Ok(t) => t,
                 Err(e) => {
-                    let _ = log_tx.send(format!("USB error: {e}"));
+                    if let Some(message) = connect_log.failed(&e.to_string()) {
+                        let _ = log_tx.send(message);
+                    }
                     tokio::time::sleep(Duration::from_secs(1)).await;
                     continue;
                 }
             };
+            connect_log.connected();
             let _ = log_tx.send("Switch connected".into());
             let _ = event_tx.send(ServerEvent::Started);
 
@@ -419,6 +550,9 @@ pub fn spawn_server(
                 ServerUpdate::Progress { name, sent, total } => {
                     let _ = events.send(ServerEvent::Progress { name, sent, total });
                 }
+                ServerUpdate::Completed { name, bytes } => {
+                    let _ = events.send(ServerEvent::Completed { name, bytes });
+                }
             };
             match server.run(&mut on_update).await {
                 Ok(()) => {
@@ -428,6 +562,7 @@ pub fn spawn_server(
                 }
                 Err(e) => {
                     let _ = log_tx.send(format!("Connection lost: {e}"));
+                    let _ = event_tx.send(ServerEvent::Disconnected);
                     continue;
                 }
             }
@@ -438,8 +573,36 @@ pub fn spawn_server(
 /// Hint line shown while the picker is open.
 const PICKER_HINT: &str = "Esc cancel  Enter open  Space add  Bksp up  / filter";
 
-/// Hint line shown in the normal view.
-const NORMAL_HINT: &str = "[a]dd  [d]elete  [c]lear  [s]tart  [q]uit  [?] help";
+/// The normal-view hint broken into keyed chip pairs: bracketed key text, label
+/// remainder, and the key character (for locked-out detection).
+const NORMAL_ACTIONS: [(&str, &str, char); 6] = [
+    ("[a]", "dd", 'a'),
+    ("[d]", "elete", 'd'),
+    ("[c]", "lear", 'c'),
+    ("[s]", "tart", 's'),
+    ("[q]", "uit", 'q'),
+    ("[?]", " help", '?'),
+];
+
+/// The normal-mode hint as keyed chips. While the server task is active the
+/// locked-out editing keys (`a`/`d`/`c`) are rendered dimmed.
+fn normal_hint_line(server_active: bool) -> Line<'static> {
+    let mut spans: Vec<Span> = Vec::new();
+    for (index, (key, label, key_char)) in NORMAL_ACTIONS.iter().enumerate() {
+        if index > 0 {
+            spans.push(Span::raw("  "));
+        }
+        let locked = server_active && matches!(key_char, 'a' | 'd' | 'c');
+        if locked {
+            spans.push(Span::styled(key.to_string(), theme::muted_dim()));
+            spans.push(Span::styled(label.to_string(), theme::muted_dim()));
+        } else {
+            spans.push(Span::styled(key.to_string(), theme::accent()));
+            spans.push(Span::styled(label.to_string(), theme::text()));
+        }
+    }
+    Line::from(spans)
+}
 
 pub fn ui(frame: &mut Frame, app: &App) {
     let area = frame.area();
@@ -485,41 +648,106 @@ pub fn ui(frame: &mut Frame, app: &App) {
 }
 
 fn render_header(frame: &mut Frame, app: &App, area: Rect) {
-    let state = match app.status {
-        ServerStatus::Idle => "idle",
-        ServerStatus::Running => "running",
+    let halves = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(area);
+    let (state_text, color) = match app.status {
+        ServerStatus::Idle => ("○ idle".to_string(), theme::IDLE),
+        ServerStatus::Waiting => {
+            let frames = theme::SPINNER_FRAMES;
+            let position = (app.started_at.elapsed().as_millis() / 200) as usize;
+            (
+                format!("{} waiting…", frames[position % frames.len()]),
+                theme::WARNING,
+            )
+        }
+        ServerStatus::Running => ("● running".to_string(), theme::SUCCESS),
     };
-    let text = format!(
-        "status: {state} | files: {} | total: {}",
-        app.files.len(),
-        human_size(app.files.total_size())
+    let left = Line::from(vec![
+        Span::styled(
+            theme::APP_NAME.to_string(),
+            theme::accent().add_modifier(Modifier::BOLD),
+        ),
+        Span::raw("  "),
+        Span::styled(state_text, theme::fg(color)),
+    ]);
+    let count = if app.files.len() == 1 {
+        "1 file".to_string()
+    } else {
+        format!("{} files", app.files.len())
+    };
+    let right = format!("{count} · total: {}", human_size(app.files.total_size()));
+    frame.render_widget(Paragraph::new(left), halves[0]);
+    frame.render_widget(
+        Paragraph::new(right)
+            .style(theme::muted())
+            .alignment(Alignment::Right),
+        halves[1],
     );
-    let widget = Paragraph::new(text).style(Style::default().fg(status_color(app.status)));
-    frame.render_widget(widget, area);
 }
 
 fn render_files(frame: &mut Frame, app: &App, area: Rect) {
-    let items: Vec<ListItem> = app
+    if app.files.is_empty() {
+        render_empty_files_hint(frame, area);
+        return;
+    }
+    let widths = [
+        Constraint::Min(4),
+        Constraint::Length(10),
+        Constraint::Min(8),
+    ];
+    let rows: Vec<Row> = app
         .files
         .iter()
         .map(|(name, entry)| {
-            ListItem::new(format!(
-                "{}  {}  ->  {}",
-                name,
-                human_size(entry.size),
-                entry.path.display()
-            ))
+            Row::new(vec![
+                Cell::from(Span::styled(name.clone(), theme::text())),
+                Cell::from(
+                    Line::styled(human_size(entry.size), theme::muted())
+                        .alignment(Alignment::Right),
+                ),
+                Cell::from(Span::styled(
+                    abbrev_path(
+                        &entry.path.display().to_string(),
+                        (area.width as usize).saturating_sub(20),
+                    ),
+                    theme::muted(),
+                )),
+            ])
         })
         .collect();
-    let files = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title("Files"))
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+    let files = Table::new(rows, widths)
+        .block(theme::block_title("Files"))
+        .column_spacing(2)
+        .row_highlight_style(theme::selection())
         .highlight_symbol("> ");
-    let mut state = ListState::default();
+    let mut state = TableState::default();
     if !app.files.is_empty() {
         state.select(Some(app.selected.min(app.files.len() - 1)));
     }
     frame.render_stateful_widget(files, area, &mut state);
+}
+
+/// A centered onboarding hint shown when no files are offered (picker closed).
+fn render_empty_files_hint(frame: &mut Frame, area: Rect) {
+    let block = theme::block_title("Files");
+    let inner = block.inner(area);
+    let bands = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(45),
+            Constraint::Length(1),
+            Constraint::Percentage(55),
+        ])
+        .split(inner);
+    let hint = Paragraph::new(Span::styled(
+        "No files yet — press `a` to add files",
+        theme::muted(),
+    ))
+    .alignment(Alignment::Center);
+    frame.render_widget(block, area);
+    frame.render_widget(hint, bands[1]);
 }
 
 fn render_progress(frame: &mut Frame, app: &App, area: Rect) {
@@ -532,16 +760,46 @@ fn render_progress(frame: &mut Frame, app: &App, area: Rect) {
         0.0
     };
     let percent = (ratio * 100.0).round() as u64;
-    let speed = progress
-        .speed
-        .map(|bytes| format!("  {}/s", human_size(bytes)))
-        .unwrap_or_default();
-    let label = format!("Sending {}  {}%{}", progress.name, percent, speed);
+    let mut spans = vec![
+        Span::styled("Sending ", theme::muted()),
+        Span::styled(progress.name.clone(), theme::text()),
+        Span::styled(format!("  {percent}%"), theme::text()),
+        Span::styled(
+            format!(
+                "  {}/{}",
+                human_size(progress.sent),
+                human_size(progress.total)
+            ),
+            theme::muted(),
+        ),
+    ];
+    if let Some(bytes) = progress.speed {
+        spans.push(Span::styled(
+            format!("  {}/s", human_size(bytes)),
+            theme::muted(),
+        ));
+    }
+    if let Some(eta) = progress.eta {
+        spans.push(Span::styled(
+            format!("  eta {}", format_elapsed(Duration::from_secs(eta))),
+            theme::muted(),
+        ));
+    }
+    let line = Line::from(spans);
+
+    // One stable row: the statistics text leads, the bar fills the remainder of
+    // that row (and disappears entirely when the text already spans the width).
+    let halves = Layout::default()
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Length(line.width() as u16), Constraint::Min(0)])
+        .split(area);
+    frame.render_widget(Paragraph::new(line), halves[0]);
+
     let gauge = Gauge::default()
-        .gauge_style(Style::default().fg(Color::Green))
+        .gauge_style(Style::default().fg(theme::SUCCESS))
         .ratio(ratio)
-        .label(label);
-    frame.render_widget(gauge, area);
+        .label("");
+    frame.render_widget(gauge, halves[1]);
 }
 
 fn render_log(frame: &mut Frame, app: &App, area: Rect) {
@@ -559,50 +817,75 @@ fn render_log(frame: &mut Frame, app: &App, area: Rect) {
         })
         .collect();
     let log = Paragraph::new(log_lines)
-        .block(Block::default().borders(Borders::ALL).title("Log"))
+        .block(theme::block_title("Log"))
         .wrap(Wrap { trim: true });
     frame.render_widget(log, area);
 }
 
 fn render_help(frame: &mut Frame, app: &App, area: Rect) {
-    let (text, color) = match &app.mode {
+    let line = match &app.mode {
         Mode::Picker(picker) => match picker.error() {
-            Some(error) => (format!("Error: {error}"), Color::Red),
-            None => (PICKER_HINT.to_string(), Color::Yellow),
+            Some(error) => Line::from(Span::styled(
+                format!("Error: {error}"),
+                theme::fg(theme::DANGER),
+            )),
+            None => Line::from(Span::styled(PICKER_HINT, theme::fg(theme::WARNING))),
         },
-        Mode::Confirm(_) => (
-            "Press y to confirm, any other key to cancel".to_string(),
-            Color::Yellow,
-        ),
-        _ => (NORMAL_HINT.to_string(), Color::Yellow),
+        Mode::Confirm(_) => Line::from(Span::styled(
+            "Press y to confirm, any other key to cancel",
+            theme::muted(),
+        )),
+        _ => normal_hint_line(app.server_started),
     };
-    let widget = Paragraph::new(text).style(Style::default().fg(color));
-    frame.render_widget(widget, area);
+    frame.render_widget(Paragraph::new(line), area);
 }
 
 fn render_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
-    let items: Vec<ListItem> = picker
+    let rows: Vec<Row> = picker
         .entries()
         .iter()
         .map(|entry| {
-            let suffix = if entry.kind == Kind::Dir { "/" } else { "" };
-            ListItem::new(format!("{}{}", entry.name, suffix))
+            let (name, name_style, size) = match entry.kind {
+                Kind::Dir => (format!("{}/", entry.name), theme::accent(), String::new()),
+                Kind::File => (
+                    entry.name.clone(),
+                    theme::text(),
+                    entry.size.map(human_size).unwrap_or_default(),
+                ),
+            };
+            Row::new(vec![
+                Cell::from(Span::styled(name, name_style)),
+                Cell::from(Line::styled(size, theme::muted()).alignment(Alignment::Right)),
+            ])
         })
         .collect();
+    let count = if picker.filter().is_empty() {
+        if picker.entries().len() == 1 {
+            "1 entry".to_string()
+        } else {
+            format!("{} entries", picker.entries().len())
+        }
+    } else if picker.entries().len() == 1 {
+        "1 match".to_string()
+    } else {
+        format!("{} matches", picker.entries().len())
+    };
     let title = if picker.filter().is_empty() {
-        format!("Pick a path: {}", picker.dir().display())
+        format!("Pick a path: {} · {count}", picker.dir().display())
     } else {
         format!(
-            "Pick a path: {}  [filter: {}]",
+            "Pick a path: {}  [filter: {}] · {count}",
             picker.dir().display(),
             picker.filter()
         )
     };
-    let list = List::new(items)
-        .block(Block::default().borders(Borders::ALL).title(title))
-        .highlight_style(Style::default().fg(Color::Black).bg(Color::Cyan))
+    let widths = [Constraint::Min(8), Constraint::Length(10)];
+    let list = Table::new(rows, widths)
+        .block(theme::block_title(title))
+        .column_spacing(2)
+        .row_highlight_style(theme::selection())
         .highlight_symbol("> ");
-    let mut state = ListState::default();
+    let mut state = TableState::default();
     if !picker.entries().is_empty() {
         state.select(Some(picker.cursor()));
     }
@@ -617,9 +900,12 @@ fn render_confirm(frame: &mut Frame, kind: ConfirmKind, area: Rect) {
     let popup = centered_fixed(prompt.len() as u16 + 2, 3, area);
     frame.render_widget(Clear, popup);
     let widget = Paragraph::new(prompt)
-        .style(Style::default().fg(Color::Black).bg(Color::Yellow))
         .alignment(Alignment::Center)
-        .block(Block::default().borders(Borders::ALL).title("Confirm"));
+        .block(theme::block_title(Span::styled(
+            "Confirm",
+            theme::fg(theme::WARNING),
+        )))
+        .style(theme::fg(theme::WARNING));
     frame.render_widget(widget, popup);
 }
 
@@ -638,7 +924,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
     let popup = centered_rect(70, 60, area);
     frame.render_widget(Clear, popup);
     let widget = Paragraph::new(text)
-        .block(Block::default().borders(Borders::ALL).title("Help"))
+        .block(theme::block_title("Help"))
         .wrap(Wrap { trim: true });
     frame.render_widget(widget, popup);
 }
@@ -675,23 +961,18 @@ fn centered_rect(percent_x: u16, percent_y: u16, area: Rect) -> Rect {
         .split(vertical[1])[1]
 }
 
-fn status_color(status: ServerStatus) -> Color {
-    match status {
-        ServerStatus::Idle => Color::Gray,
-        ServerStatus::Running => Color::Green,
-    }
-}
-
 fn log_color(message: &str) -> Color {
     if message.starts_with("Warning:") {
-        Color::Yellow
+        theme::WARNING
     } else if message.starts_with("Failed")
         || message.starts_with("USB error")
         || message.starts_with("Connection lost")
     {
-        Color::Red
+        theme::DANGER
+    } else if message.starts_with("Sent:") {
+        theme::SUCCESS
     } else {
-        Color::Gray
+        theme::SUBTLE
     }
 }
 
@@ -722,10 +1003,42 @@ fn human_size(bytes: u64) -> String {
     }
 }
 
+/// Estimated seconds remaining for a transfer at the given speed.
+fn remaining_seconds(sent: u64, total: u64, speed: u64) -> u64 {
+    if sent >= total || speed == 0 {
+        0
+    } else {
+        (total - sent).div_ceil(speed)
+    }
+}
+
+/// Truncate a path's display text from the middle, keeping both ends so the file
+/// name tail stays visible. The ellipsis counts as one character; the result is
+/// never wider than `max_width` characters.
+fn abbrev_path(path: &str, max_width: usize) -> String {
+    let chars: Vec<char> = path.chars().collect();
+    if chars.len() <= max_width {
+        return path.to_string();
+    }
+    if max_width == 0 {
+        return String::new();
+    }
+    let keep = max_width - 1;
+    if keep == 0 {
+        return "…".to_string();
+    }
+    let head = keep - keep / 2;
+    let tail = keep / 2;
+    let head_str: String = chars[..head].iter().collect();
+    let tail_str: String = chars[chars.len() - tail..].iter().collect();
+    format!("{head_str}…{tail_str}")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+    use dbi_backend_core::transport::{Transport, TransportError};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::fs;
@@ -761,6 +1074,12 @@ mod tests {
             out.push('\n');
         }
         out
+    }
+
+    fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
+        (0..buffer.area.width)
+            .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+            .collect()
     }
 
     #[test]
@@ -833,11 +1152,70 @@ mod tests {
     }
 
     #[test]
+    fn s_sets_waiting_until_the_device_connects() {
+        let mut app = App::new(FileList::new());
+        app.files.insert("a", "/tmp/a");
+
+        assert_eq!(app.handle_key(press('s')), Action::Start);
+        assert_eq!(app.status, ServerStatus::Waiting);
+    }
+
+    #[test]
+    fn started_makes_running_and_disconnected_returns_to_waiting() {
+        let mut app = App::new(FileList::new());
+        app.files.insert("a", "/tmp/a");
+        app.handle_key(press('s'));
+
+        app.handle_server_event(ServerEvent::Started);
+        assert_eq!(app.status, ServerStatus::Running);
+
+        app.handle_server_event(ServerEvent::Disconnected);
+        assert_eq!(app.status, ServerStatus::Waiting);
+    }
+
+    #[test]
+    fn progress_does_not_survive_disconnect_and_reconnect() {
+        let mut app = App::new(FileList::new());
+        app.handle_server_event(ServerEvent::Started);
+        app.handle_server_event(ServerEvent::Progress {
+            name: "game.nsp".into(),
+            sent: 50,
+            total: 100,
+        });
+        assert!(app.progress.is_some());
+
+        app.handle_server_event(ServerEvent::Disconnected);
+        assert!(app.progress.is_none());
+
+        app.handle_server_event(ServerEvent::Started);
+        assert!(app.progress.is_none());
+        assert!(!render(&app, 120, 12).contains("Sending game.nsp"));
+    }
+
+    #[test]
+    fn edits_stay_inert_while_waiting() {
+        let mut app = App::new(FileList::new());
+        app.files.insert("a", "/tmp/a");
+        app.handle_key(press('s'));
+        assert_eq!(app.status, ServerStatus::Waiting);
+
+        assert_eq!(app.handle_key(press('a')), Action::None);
+        assert!(matches!(app.mode, Mode::Normal));
+        assert_eq!(app.handle_key(press('d')), Action::None);
+        assert_eq!(app.files.len(), 1);
+        assert_eq!(app.handle_key(press('c')), Action::None);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
     fn ended_event_returns_to_idle_and_allows_restart() {
         let mut app = App::new(FileList::new());
         app.files.insert("a", "/tmp/a");
 
         assert_eq!(app.handle_key(press('s')), Action::Start);
+        assert_eq!(app.status, ServerStatus::Waiting);
+
+        app.handle_server_event(ServerEvent::Started);
         assert_eq!(app.status, ServerStatus::Running);
 
         app.handle_server_event(ServerEvent::Ended);
@@ -851,10 +1229,16 @@ mod tests {
         let mut app = App::new(FileList::new());
         app.files.insert("keep", "/tmp/keep");
         assert_eq!(app.handle_key(press('s')), Action::Start);
+        assert!(matches!(app.status, ServerStatus::Waiting));
 
         assert_eq!(app.handle_key(press('a')), Action::None);
         assert!(matches!(app.mode, Mode::Normal));
         assert_eq!(app.handle_key(press('c')), Action::None);
+        assert_eq!(app.files.len(), 1);
+
+        app.handle_server_event(ServerEvent::Started);
+        assert!(matches!(app.status, ServerStatus::Running));
+        assert_eq!(app.handle_key(press('d')), Action::None);
         assert_eq!(app.files.len(), 1);
 
         app.handle_server_event(ServerEvent::Ended);
@@ -1082,14 +1466,114 @@ mod tests {
     }
 
     #[test]
-    fn status_header_is_colored_by_state() {
-        let mut app = App::new(FileList::new());
-        assert_eq!(buffer(&app, 40, 12).cell((0, 0)).unwrap().fg, Color::Gray);
+    fn empty_file_list_shows_an_onboarding_hint() {
+        let empty = App::new(FileList::new());
+        let view = render(&empty, 60, 12);
+        assert!(view.contains("No files yet"));
+        assert!(view.contains("press `a` to add"));
+        assert!(view.contains("No files yet — press `a` to add"));
 
+        let mut populated = App::new(FileList::new());
+        populated.files.insert("a.nsp", "/tmp/a.nsp");
+        let view = render(&populated, 60, 12);
+        assert!(!view.contains("No files yet"));
+    }
+
+    #[test]
+    fn size_column_is_right_aligned_in_the_files_table() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.nsp"), vec![0u8; 1024]).unwrap();
+        fs::write(dir.path().join("verylonggamename.nsp"), vec![0u8; 2048]).unwrap();
+        let mut app = App::new(FileList::new());
+        app.files.add_path(dir.path()).unwrap();
+
+        let buf = buffer(&app, 80, 12);
+        // Files rows start below the header (y=0) and the top border (y=1); the last
+        // character of a right-aligned size cell is the same 'B' x-position in both rows.
+        let size_x = |y: u16| {
+            (0..buf.area.width)
+                .find(|x| buf.cell((*x, y)).unwrap().symbol() == "B")
+                .expect("size cell 'B' in files row")
+        };
+        assert_eq!(size_x(2), size_x(3));
+    }
+
+    #[test]
+    fn header_identifies_the_app_and_shows_counts() {
+        let app = App::new(FileList::new());
+        let view = render(&app, 80, 12);
+        assert!(view.contains(theme::APP_NAME));
+        assert!(view.contains("idle"));
+        assert!(view.contains("0 files · total: 0 B"));
+
+        let mut app = App::new(FileList::new());
+        app.files.insert("a.nsp", "/tmp/a.nsp");
+        app.files.insert("b.nsp", "/tmp/b.nsp");
+        let view = render(&app, 80, 12);
+        assert!(view.contains("2 files"));
+    }
+
+    #[test]
+    fn hint_chips_dim_locked_keys_while_the_server_is_active() {
+        let idle = App::new(FileList::new());
+        let bottom = |app: &App| {
+            let buf = buffer(app, 60, 12);
+            let y = buf.area.height - 1;
+            (0..buf.area.width)
+                .map(|x| buf.cell((x, y)).unwrap().fg)
+                .collect::<Vec<_>>()
+        };
+
+        let idle_fgs = bottom(&idle);
+        assert!(
+            idle_fgs.contains(&theme::ACCENT),
+            "keys are accented when idle"
+        );
+        assert!(
+            !idle_fgs.contains(&theme::MUTED),
+            "no muted cells when idle"
+        );
+
+        let mut active = App::new(FileList::new());
+        active.files.insert("a", "/tmp/a");
+        active.handle_key(press('s'));
+        assert!(active.server_started);
+        let active_fgs = bottom(&active);
+        assert!(
+            active_fgs.iter().filter(|c| **c == theme::MUTED).count() >= 12,
+            "locked a/d/c chips render dimmed"
+        );
+        assert!(
+            active_fgs.contains(&theme::ACCENT),
+            "unlocked keys stay accented"
+        );
+    }
+
+    #[test]
+    fn status_header_is_colored_by_state() {
+        let app = App::new(FileList::new());
+        // x=13 is the status capsule: "dbi-backend" (11 chars) + two spaces.
+        assert_eq!(buffer(&app, 80, 12).cell((13, 0)).unwrap().fg, Color::Gray);
+        let view = render(&app, 80, 12);
+        assert!(view.contains("idle"));
+
+        let mut app = App::new(FileList::new());
         app.files.insert("a", "/tmp/a");
         app.handle_key(press('s'));
+        assert_eq!(app.status, ServerStatus::Waiting);
+        let view = render(&app, 80, 12);
+        assert!(view.contains("waiting"));
+        // The spinner glyph varies with wall-clock time, so assert color only.
+        assert_eq!(
+            buffer(&app, 80, 12).cell((13, 0)).unwrap().fg,
+            Color::Yellow
+        );
+
+        app.handle_server_event(ServerEvent::Started);
         assert_eq!(app.status, ServerStatus::Running);
-        assert_eq!(buffer(&app, 40, 12).cell((0, 0)).unwrap().fg, Color::Green);
+        let view = render(&app, 80, 12);
+        assert!(view.contains("running"));
+        assert_eq!(buffer(&app, 80, 12).cell((13, 0)).unwrap().fg, Color::Green);
     }
 
     #[test]
@@ -1104,22 +1588,589 @@ mod tests {
     }
 
     #[test]
+    fn remaining_seconds_divides_remainder_by_speed() {
+        assert_eq!(remaining_seconds(75, 100, 25), 1);
+        assert_eq!(remaining_seconds(0, 300, 100), 3);
+        assert_eq!(remaining_seconds(100, 100, 25), 0);
+        assert_eq!(remaining_seconds(50, 100, 0), 0);
+    }
+
+    #[test]
+    fn progress_eta_comes_from_the_second_sample() {
+        let mut app = App::new(FileList::new());
+        let start = Instant::now();
+        app.handle_server_event(ServerEvent::Started);
+        app.update_progress_at("a.nsp".into(), 50, 100, start);
+        let first = app.progress.as_ref().unwrap();
+        assert!(first.speed.is_none());
+        assert_eq!(first.eta, None);
+
+        app.update_progress_at("a.nsp".into(), 75, 100, start + Duration::from_secs(1));
+        let second = app.progress.as_ref().unwrap();
+        assert_eq!(second.speed, Some(25));
+        assert_eq!(second.eta, Some(1));
+    }
+
+    #[test]
+    fn progress_speed_is_smoothed_across_uneven_samples() {
+        let mut app = App::new(FileList::new());
+        let start = Instant::now();
+        app.handle_server_event(ServerEvent::Started);
+
+        app.update_progress_at("game.nsp".into(), 0, 10_000, start);
+        app.update_progress_at(
+            "game.nsp".into(),
+            1_000,
+            10_000,
+            start + Duration::from_secs(1),
+        );
+        app.update_progress_at(
+            "game.nsp".into(),
+            1_200,
+            10_000,
+            start + Duration::from_millis(1_200),
+        );
+        assert_eq!(app.progress.as_ref().unwrap().speed, Some(1_000));
+
+        // The final interval is much slower than the earlier ones. A single-interval
+        // estimate would collapse to 100 B/s; the smoothed rate stays between the old
+        // and new instantaneous values.
+        app.update_progress_at(
+            "game.nsp".into(),
+            1_300,
+            10_000,
+            start + Duration::from_millis(2_200),
+        );
+        let state = app.progress.as_ref().unwrap();
+        let speed = state.speed.unwrap();
+        assert!(
+            (101..1_000).contains(&speed),
+            "smoothed speed {speed} should be between 100 and 1000"
+        );
+        assert_eq!(state.eta, Some(remaining_seconds(1_300, 10_000, speed)));
+    }
+
+    #[test]
+    fn sub_100ms_samples_do_not_recompute_the_speed() {
+        let mut app = App::new(FileList::new());
+        let start = Instant::now();
+        app.handle_server_event(ServerEvent::Started);
+
+        app.update_progress_at("game.nsp".into(), 0, 10_000, start);
+        app.update_progress_at(
+            "game.nsp".into(),
+            1_000,
+            10_000,
+            start + Duration::from_secs(1),
+        );
+        assert_eq!(app.progress.as_ref().unwrap().speed, Some(1_000));
+
+        app.update_progress_at(
+            "game.nsp".into(),
+            1_500,
+            10_000,
+            start + Duration::from_millis(1_050),
+        );
+        let state = app.progress.as_ref().unwrap();
+        assert_eq!(state.sent, 1_500);
+        assert_eq!(state.speed, Some(1_000));
+    }
+
+    #[test]
+    fn progress_eta_is_carried_when_no_bytes_advance() {
+        let mut app = App::new(FileList::new());
+        let start = Instant::now();
+        app.handle_server_event(ServerEvent::Started);
+
+        app.update_progress_at("game.nsp".into(), 500, 2_000, start);
+        app.update_progress_at(
+            "game.nsp".into(),
+            1_000,
+            2_000,
+            start + Duration::from_secs(1),
+        );
+        let before = app.progress.as_ref().unwrap().clone();
+        assert_eq!(before.speed, Some(500));
+        assert_eq!(before.eta, Some(2));
+
+        app.update_progress_at(
+            "game.nsp".into(),
+            1_000,
+            2_000,
+            start + Duration::from_secs(2),
+        );
+        let after = app.progress.as_ref().unwrap();
+        assert_eq!(after.speed, before.speed);
+        assert_eq!(after.eta, before.eta);
+    }
+
+    #[test]
+    fn progress_eta_is_zero_when_complete() {
+        let mut app = App::new(FileList::new());
+        let start = Instant::now();
+        app.handle_server_event(ServerEvent::Started);
+
+        app.update_progress_at("game.nsp".into(), 900, 1_000, start);
+        app.update_progress_at(
+            "game.nsp".into(),
+            1_000,
+            1_000,
+            start + Duration::from_secs(1),
+        );
+        let state = app.progress.as_ref().unwrap();
+        assert_eq!(state.speed, Some(100));
+        assert_eq!(state.eta, Some(0));
+
+        // A streamed phase restarting at the file's beginning replaces the
+        // finished fill in the region: the bar shows the new position and the
+        // previous 100% fill is gone.
+        app.update_progress_at("game.nsp".into(), 10, 1_000, start + Duration::from_secs(2));
+        let view = render(&app, 120, 12);
+        assert!(view.contains("Sending game.nsp"));
+        assert!(
+            view.contains("1%"),
+            "the region follows the restart: {view}"
+        );
+        assert!(
+            !view.contains("100%"),
+            "the old fill must not linger: {view}"
+        );
+
+        // The restart logs nothing: only an explicit completed event produces
+        // the file's success summary.
+        assert!(app.log.is_empty());
+        app.handle_server_event(ServerEvent::Completed {
+            name: "game.nsp".into(),
+            bytes: 1_000,
+        });
+        assert_eq!(app.log.len(), 1);
+        assert!(app.log[0].message.contains("Sent: game.nsp"));
+    }
+
+    #[test]
+    fn progress_backward_sample_restarts_the_phase() {
+        let mut app = App::new(FileList::new());
+        let start = Instant::now();
+        app.handle_server_event(ServerEvent::Started);
+
+        // Build a measured speed in the first streamed phase.
+        app.update_progress_at("game.nsp".into(), 500, 1_000, start);
+        app.update_progress_at(
+            "game.nsp".into(),
+            1_000,
+            1_000,
+            start + Duration::from_secs(1),
+        );
+        assert!(app.progress.as_ref().unwrap().speed.is_some());
+
+        // A backward sample streams again from the file's start: the bar follows
+        // it and no estimate from the finished phase is carried over.
+        app.update_progress_at("game.nsp".into(), 10, 1_000, start + Duration::from_secs(2));
+        let state = app.progress.as_ref().unwrap();
+        assert_eq!(state.name, "game.nsp");
+        assert_eq!(state.sent, 10);
+        assert_eq!(state.speed, None, "speed is discarded on a backward jump");
+        assert_eq!(state.eta, None, "eta is discarded on a backward jump");
+
+        // The next forward sample re-measures speed from the new baseline.
+        app.update_progress_at(
+            "game.nsp".into(),
+            110,
+            1_000,
+            start + Duration::from_secs(3),
+        );
+        let state = app.progress.as_ref().unwrap();
+        assert_eq!(state.speed, Some(100));
+        assert_eq!(state.eta, Some(9));
+    }
+
+    /// A transport preset with the reads of a scripted DBI exchange; writes go
+    /// nowhere because the assertions below look at the app state, not the wire.
+    struct MockTransport {
+        reads: VecDeque<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for MockTransport {
+        async fn read(&mut self, _len: usize) -> Result<Vec<u8>, TransportError> {
+            self.reads
+                .pop_front()
+                .ok_or_else(|| TransportError::Usb("no more reads".into()))
+        }
+
+        async fn write(&mut self, _data: &[u8]) -> Result<(), TransportError> {
+            Ok(())
+        }
+    }
+
+    fn range_req_header(name: &str, range_size: u32, offset: u64) -> Vec<u8> {
+        let mut header = Vec::new();
+        header.extend_from_slice(&range_size.to_le_bytes());
+        header.extend_from_slice(&offset.to_le_bytes());
+        header.extend_from_slice(&(name.len() as u32).to_le_bytes());
+        header.extend_from_slice(name.as_bytes());
+        header
+    }
+
+    fn range_request(name: &str, range_size: u32, offset: u64) -> Vec<Vec<u8>> {
+        let header = range_req_header(name, range_size, offset);
+        let data_size = header.len() as u32;
+        vec![
+            dbi_backend_core::protocol::Header::new(
+                dbi_backend_core::protocol::CMD_TYPE_REQUEST,
+                dbi_backend_core::protocol::CMD_ID_FILE_RANGE,
+                data_size,
+            )
+            .to_bytes()
+            .to_vec(),
+            header,
+            vec![0u8; 16], // the payload acknowledgment (contents unrecognized)
+        ]
+    }
+
+    // The end-to-end defect flow: the DBI preparation reads (start at offset
+    // zero, a continuation, the silent trailing read ending at the file's last
+    // byte) followed by the content stream restarting at zero and running to
+    // the end. Drives real `Server` updates into an `App` the way spawn_server
+    // does.
+    #[tokio::test]
+    async fn preparation_reads_and_restart_never_flash_a_full_bar_before_install() {
+        let total = 100usize;
+        let content: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.nsp");
+        fs::write(&path, &content).unwrap();
+
+        let name = "game.nsp";
+        let mut files = FileList::new();
+        files.insert(name, &path);
+
+        let reads = [
+            range_request(name, 10, 0),  // streamed start
+            range_request(name, 10, 10), // streamed continuation
+            range_request(name, 2, 98),  // trailing auxiliary read at the file's end
+            range_request(name, 10, 0),  // restart: the install streams from zero
+            range_request(name, 90, 10), // streamed continuation to the file's end
+            vec![dbi_backend_core::protocol::Header::new(
+                dbi_backend_core::protocol::CMD_TYPE_REQUEST,
+                dbi_backend_core::protocol::CMD_ID_EXIT,
+                0,
+            )
+            .to_bytes()
+            .to_vec()],
+        ]
+        .concat();
+
+        let mut app = App::new(FileList::new());
+        app.handle_server_event(ServerEvent::Started);
+
+        let mut install_phase = false;
+        let mut sending_lines = 0usize;
+
+        Server::new(MockTransport { reads: reads.into() }, files)
+            .run(|update| match update {
+                ServerUpdate::Log(line) => {
+                    if line.starts_with("Sending: ") {
+                        sending_lines += 1;
+                        if sending_lines == 2 {
+                            // The second announcement opens the restarted, real
+                            // install streaming.
+                            install_phase = true;
+                        }
+                    }
+                    app.push_log(line);
+                }
+                ServerUpdate::Progress { name, sent, total } => {
+                    if !install_phase {
+                        assert!(
+                            sent < total,
+                            "the region must not receive a full fill before the install streams: {sent}/{total}"
+                        );
+                    }
+                    app.handle_server_event(ServerEvent::Progress { name, sent, total });
+                }
+                ServerUpdate::Completed { name, bytes } => {
+                    app.handle_server_event(ServerEvent::Completed { name, bytes });
+                }
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(sending_lines, 2, "one announcement per streamed sequence");
+        let sent_lines = app
+            .log
+            .iter()
+            .filter(|line| line.message.starts_with("Sent: "))
+            .count();
+        assert_eq!(sent_lines, 1, "exactly one completion summary");
+        assert!(
+            app.progress.is_none(),
+            "the region ends with the completion"
+        );
+    }
+
+    #[test]
+    fn progress_eta_resets_for_a_new_file() {
+        let mut app = App::new(FileList::new());
+        let start = Instant::now();
+        app.handle_server_event(ServerEvent::Started);
+        app.update_progress_at("a.nsp".into(), 90, 100, start);
+        app.update_progress_at("a.nsp".into(), 100, 100, start + Duration::from_secs(1));
+        assert!(app.progress.as_ref().unwrap().speed.is_some());
+
+        app.update_progress_at("b.nsp".into(), 10, 100, start + Duration::from_secs(2));
+        let state = app.progress.as_ref().unwrap();
+        assert_eq!(state.name, "b.nsp");
+        assert_eq!(state.speed, None);
+        assert_eq!(state.eta, None);
+    }
+
+    #[test]
     fn progress_event_updates_and_clears() {
+        let mut app = App::new(FileList::new());
+        let start = Instant::now();
+        app.handle_server_event(ServerEvent::Started);
+        app.update_progress_at("game.nsp".into(), 50, 100, start);
+
+        let view = render(&app, 120, 12);
+        assert!(view.contains("game.nsp"));
+        assert!(view.contains("50%"));
+        // Byte counts are human-readable; no eta before a second sample.
+        assert!(view.contains("50 B/100 B"));
+        assert!(!view.contains("eta"));
+
+        // A second sample on the same file measures a speed and derives an eta.
+        app.update_progress_at("game.nsp".into(), 75, 100, start + Duration::from_secs(1));
+        let view = render(&app, 120, 12);
+        assert!(view.contains("75 B/100 B"));
+        assert!(view.contains("eta"));
+
+        app.handle_server_event(ServerEvent::Ended);
+        let view = render(&app, 120, 12);
+        assert!(!view.contains("Sending game.nsp"));
+    }
+
+    #[test]
+    fn progress_renders_the_name_and_the_bar_on_one_row() {
+        let mut app = App::new(FileList::new());
+        let start = Instant::now();
+        app.handle_server_event(ServerEvent::Started);
+        app.update_progress_at("game.nsp".into(), 100, 100, start);
+
+        let buf = buffer(&app, 80, 12);
+        let name_y = (0..buf.area.height)
+            .find(|y| row_text(&buf, *y).contains("Sending game.nsp"))
+            .expect("progress text row");
+
+        assert!(
+            row_text(&buf, name_y).contains('█'),
+            "the bar fills the remainder of the same row"
+        );
+
+        let name_x = row_text(&buf, name_y).find("game.nsp").unwrap() as u16;
+        let name_cell = buf.cell((name_x, name_y)).unwrap();
+        assert_ne!(
+            name_cell.bg,
+            theme::SUCCESS,
+            "the file name is not drawn on the success fill"
+        );
+    }
+
+    #[test]
+    fn progress_keeps_the_file_name_at_the_start_of_a_narrow_row() {
+        let mut app = App::new(FileList::new());
+        let start = Instant::now();
+        app.handle_server_event(ServerEvent::Started);
+        app.update_progress_at("game.nsp".into(), 50, 100, start);
+
+        let view = render(&app, 30, 10);
+        let line = view
+            .lines()
+            .find(|line| line.contains("Sending"))
+            .expect("progress text row");
+        assert!(
+            line.starts_with("Sending game.nsp"),
+            "narrow progress row starts with the file name: {line:?}"
+        );
+        assert!(
+            !view.contains('█'),
+            "the bar yields to the statistics text when the row is too narrow"
+        );
+    }
+
+    #[test]
+    fn progress_bar_fills_from_reported_bytes() {
+        let mut app = App::new(FileList::new());
+        let start = Instant::now();
+        app.handle_server_event(ServerEvent::Started);
+        app.update_progress_at("game.nsp".into(), 50, 100, start);
+
+        // The bar occupies the row after the statistics text
+        // ("Sending game.nsp  50%  50 B/100 B", 33 columns) and fills it by ratio.
+        let bar_extent = |app: &App| {
+            let buf = buffer(app, 60, 12);
+            let y = (0..buf.area.height)
+                .find(|y| row_text(&buf, *y).contains("Sending game.nsp"))
+                .expect("progress row");
+            let start_x = (0..buf.area.width)
+                .find(|x| buf.cell((*x, y)).unwrap().symbol() == "█")
+                .expect("the bar starts after the statistics text");
+            let filled = (start_x..buf.area.width)
+                .filter(|x| {
+                    let cell = buf.cell((*x, y)).unwrap();
+                    cell.symbol() == "█" || cell.bg == theme::SUCCESS
+                })
+                .count();
+            (start_x, filled as u16)
+        };
+
+        let (bar_start_x, half_filled) = bar_extent(&app);
+        let bar_width = 60 - bar_start_x;
+        assert_eq!(bar_start_x, 33, "the bar starts right after the text");
+        assert!(
+            half_filled > 0 && half_filled < bar_width,
+            "half transfer leaves a partially filled bar: {half_filled}/{bar_width}"
+        );
+
+        app.update_progress_at("game.nsp".into(), 100, 100, start + Duration::from_secs(1));
+        let (bar_start_x, full_filled) = bar_extent(&app);
+        assert_eq!(
+            full_filled,
+            60 - bar_start_x,
+            "a completed bar fills its slot"
+        );
+    }
+
+    #[test]
+    fn completed_transfer_logs_a_summary_and_clears_the_progress() {
         let mut app = App::new(FileList::new());
         app.handle_server_event(ServerEvent::Started);
         app.handle_server_event(ServerEvent::Progress {
             name: "game.nsp".into(),
-            sent: 50,
+            sent: 100,
             total: 100,
         });
+        assert!(render(&app, 120, 12).contains("100%"));
 
-        let view = render(&app, 60, 12);
-        assert!(view.contains("game.nsp"));
-        assert!(view.contains("50%"));
+        app.handle_server_event(ServerEvent::Completed {
+            name: "game.nsp".into(),
+            bytes: 4096,
+        });
 
-        app.handle_server_event(ServerEvent::Ended);
-        let view = render(&app, 60, 12);
-        assert!(!view.contains("50%"));
+        assert_eq!(app.log.len(), 1);
+        assert!(app.log[0].message.contains("Sent: game.nsp"));
+        assert!(app.log[0].message.contains("4.0 KiB"));
+        assert!(app.progress.is_none());
+
+        let view = render(&app, 120, 12);
+        assert!(view.contains("Sent: game.nsp"));
+        assert!(!view.contains("100%"));
+    }
+
+    #[test]
+    fn progress_persists_between_ranges_until_a_file_completes() {
+        let mut app = App::new(FileList::new());
+        app.handle_server_event(ServerEvent::Started);
+        app.update_progress_at("game.nsp".into(), 50, 100, Instant::now());
+        assert!(render(&app, 120, 12).contains("Sending game.nsp"));
+
+        // A later range request of the same file arrives as another Progress:
+        // the region stays up and only the statistics change, without layout churn.
+        app.update_progress_at("game.nsp".into(), 75, 100, Instant::now());
+        let view = render(&app, 120, 12);
+        assert!(view.contains("Sending game.nsp"));
+        assert!(view.contains("75%"));
+
+        // Only the file-level completion ends the region, and it logs exactly one
+        // success summary for the file.
+        app.handle_server_event(ServerEvent::Completed {
+            name: "game.nsp".into(),
+            bytes: 100,
+        });
+        let view = render(&app, 120, 12);
+        assert!(!view.contains("Sending game.nsp"));
+        assert!(app.progress.is_none());
+        assert_eq!(app.log.len(), 1);
+        assert!(app.log[0].message.contains("Sent: game.nsp"));
+    }
+
+    #[test]
+    fn sending_lines_take_the_informational_log_color() {
+        let mut app = App::new(FileList::new());
+        app.push_log("Sending: game.nsp".into());
+
+        assert_eq!(log_color("Sending: game.nsp"), theme::SUBTLE);
+
+        let buffer = buffer(&app, 120, 12);
+        let mut checked = false;
+        for y in 0..buffer.area.height {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                .collect();
+            if let Some(column) = row.find("Sending: game.nsp") {
+                let cell = buffer.cell((column as u16, y)).unwrap();
+                assert_eq!(cell.fg, theme::SUBTLE);
+                checked = true;
+            }
+        }
+        assert!(checked, "the start line should be rendered");
+    }
+
+    #[test]
+    fn sent_lines_are_colored_as_success() {
+        let mut app = App::new(FileList::new());
+        app.handle_server_event(ServerEvent::Completed {
+            name: "game.nsp".into(),
+            bytes: 4096,
+        });
+
+        assert_eq!(log_color("Sent: game.nsp (4.0 KiB)"), Color::Green);
+
+        let buffer = buffer(&app, 120, 12);
+        let mut checked = false;
+        for y in 0..buffer.area.height {
+            let row: String = (0..buffer.area.width)
+                .map(|x| buffer.cell((x, y)).unwrap().symbol().to_string())
+                .collect();
+            if let Some(column) = row.find("Sent:") {
+                let cell = buffer.cell((column as u16, y)).unwrap();
+                assert_eq!(cell.fg, Color::Green);
+                checked = true;
+            }
+        }
+        assert!(checked, "the summary line should be rendered");
+    }
+
+    #[test]
+    fn connect_log_reports_the_waiting_state_once_per_period() {
+        let mut log = ConnectLog::default();
+        assert_eq!(log.waiting(), Some("Waiting for Switch..."));
+        assert_eq!(log.waiting(), None);
+
+        // The next waiting period reports the state again.
+        log.connected();
+        assert_eq!(log.waiting(), Some("Waiting for Switch..."));
+    }
+
+    #[test]
+    fn connect_log_reports_an_error_only_while_it_changes() {
+        let mut log = ConnectLog::default();
+        assert_eq!(
+            log.failed("no device"),
+            Some("USB error: no device".to_string())
+        );
+        assert_eq!(log.failed("no device"), None);
+        assert_eq!(
+            log.failed("permission denied"),
+            Some("USB error: permission denied".to_string())
+        );
+
+        // A successful connection forgets the error, so it is reported again later.
+        log.connected();
+        assert_eq!(
+            log.failed("no device"),
+            Some("USB error: no device".to_string())
+        );
     }
 
     #[test]
@@ -1164,6 +2215,106 @@ mod tests {
     }
 
     #[test]
+    fn abbrev_path_keeps_paths_that_fit() {
+        assert_eq!(abbrev_path("/tmp/a.nsp", 20), "/tmp/a.nsp");
+        assert_eq!(abbrev_path("/tmp/a.nsp", 10), "/tmp/a.nsp");
+    }
+
+    #[test]
+    fn abbrev_path_truncates_from_the_middle() {
+        let long = "/mnt/games/The Legend of Zelda Breath of the Wild/game.nsp";
+        let out = abbrev_path(long, 20);
+        assert_eq!(out.chars().count(), 20);
+        assert!(out.contains('…'));
+        assert!(out.starts_with("/mnt/games"));
+        assert!(out.ends_with("game.nsp"));
+    }
+
+    #[test]
+    fn abbrev_path_handles_degenerate_widths() {
+        assert_eq!(abbrev_path("/very/long/path", 0), "");
+        assert_eq!(abbrev_path("/very/long/path", 1), "…");
+    }
+
+    #[test]
+    fn narrow_terminal_truncates_long_paths() {
+        let dir = tempfile::tempdir().unwrap();
+        let long_name = "a-nsp-file-with-a-remarkably-long-name.nsp";
+        fs::write(dir.path().join(long_name), vec![0u8; 2048]).unwrap();
+        let mut app = App::new(FileList::new());
+        app.files.add_path(dir.path()).unwrap();
+
+        let view = render(&app, 40, 12);
+        assert!(view.contains('…'));
+    }
+
+    #[test]
+    fn picker_rows_show_file_sizes_but_not_directory_sizes() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.nsp"), vec![0u8; 1024]).unwrap();
+        fs::write(dir.path().join("verybig.nsp"), vec![0u8; 2048]).unwrap();
+        fs::create_dir(dir.path().join("games")).unwrap();
+        let mut app = App::new(FileList::new());
+        app.mode = Mode::Picker(Picker::at(dir.path()));
+
+        let buf = buffer(&app, 80, 16);
+        let mut saw_file = false;
+        let mut saw_dir = false;
+        // Only the picker's inner rows (below the title border at y=1 and above the
+        // bottom border of the list region) are scanned.
+        for y in 2..6 {
+            let row: String = (0..buf.area.width)
+                .map(|x| buf.cell((x, y)).unwrap().symbol())
+                .collect();
+            let has_size = (0..buf.area.width).any(|x| buf.cell((x, y)).unwrap().symbol() == "B");
+            if row.contains("games/") {
+                saw_dir = true;
+                assert!(!has_size, "directory row must have an empty size cell");
+            }
+            if row.contains("a.nsp") {
+                saw_file = true;
+                assert!(has_size, "file row must show its size");
+            }
+        }
+        assert!(saw_file && saw_dir);
+    }
+
+    #[test]
+    fn picker_title_shows_the_entry_count() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.nsp"), b"a").unwrap();
+        fs::write(dir.path().join("b.nsp"), b"b").unwrap();
+        let mut app = App::new(FileList::new());
+        app.mode = Mode::Picker(Picker::at(dir.path()));
+
+        let view = render(&app, 80, 12);
+        assert!(view.contains("· 2 entries"));
+    }
+
+    #[test]
+    fn picker_title_shows_the_match_count_while_filtering() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("alpha.nsp"), b"a").unwrap();
+        fs::write(dir.path().join("beta.nsp"), b"b").unwrap();
+        let mut app = App::new(FileList::new());
+        app.mode = Mode::Picker(Picker::at(dir.path()));
+        app.handle_key(press('/'));
+        app.handle_key(press('b'));
+        match &app.mode {
+            Mode::Picker(picker) => {
+                assert_eq!(picker.entries().len(), 1);
+                let view = render(&app, 80, 12);
+                assert!(view.contains("· 1 match"));
+            }
+            _ => panic!("expected the picker to stay open"),
+        }
+
+        app.handle_key(press('a'));
+        let view = render(&app, 80, 12);
+        assert!(view.contains("· 0 matches"));
+    }
+
+    #[test]
     fn centered_fixed_centers_and_clamps() {
         let area = Rect::new(0, 0, 80, 24);
         assert_eq!(centered_fixed(20, 3, area), Rect::new(30, 10, 20, 3));
@@ -1188,7 +2339,9 @@ mod tests {
             for y in 0..buf.area.height {
                 let mut row_has_dialog = false;
                 for x in 0..buf.area.width {
-                    if buf.cell((x, y)).unwrap().bg == Color::Yellow {
+                    // The themed dialog is drawn in the warning color; the muted
+                    // hint line keeps this dialog-only scan unambiguous.
+                    if buf.cell((x, y)).unwrap().fg == Color::Yellow {
                         min_x = min_x.min(x);
                         max_x = max_x.max(x);
                         row_has_dialog = true;
