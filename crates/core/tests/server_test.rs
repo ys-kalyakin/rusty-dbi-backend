@@ -2,8 +2,11 @@ use async_trait::async_trait;
 use dbi_backend_core::filelist::FileList;
 use dbi_backend_core::protocol::*;
 use dbi_backend_core::server::{Server, ServerError, ServerUpdate};
+use dbi_backend_core::source::local::LocalStore;
+use dbi_backend_core::source::{FileHandle, ListEntry, SmbLocation, Source, SourceError, Sources};
 use dbi_backend_core::transport::{Transport, TransportError};
 use std::collections::VecDeque;
+use std::sync::Arc;
 
 pub struct MockTransport {
     reads: VecDeque<Vec<u8>>,
@@ -49,7 +52,11 @@ async fn list_command_sends_file_names_then_exits() {
     files.insert("test.nsp", "/tmp/test.nsp");
 
     let reads = vec![req(CMD_ID_LIST, 0), ack(), req(CMD_ID_EXIT, 0)];
-    let mut server = Server::new(MockTransport::new(reads), files);
+    let mut server = Server::new(
+        MockTransport::new(reads),
+        files,
+        Arc::new(LocalStore::new()),
+    );
 
     server.run(|_line| {}).await.unwrap();
     let transport = server.into_transport();
@@ -70,7 +77,11 @@ async fn empty_list_command_writes_zero_length_and_does_not_read_ack() {
     let files = FileList::new();
 
     let reads = vec![req(CMD_ID_LIST, 0), req(CMD_ID_EXIT, 0)];
-    let mut server = Server::new(MockTransport::new(reads), files);
+    let mut server = Server::new(
+        MockTransport::new(reads),
+        files,
+        Arc::new(LocalStore::new()),
+    );
 
     let mut logs = Vec::new();
     server
@@ -119,7 +130,11 @@ async fn file_range_command_streams_requested_bytes() {
         ack(),
         req(CMD_ID_EXIT, 0),
     ];
-    let mut server = Server::new(MockTransport::new(reads), files);
+    let mut server = Server::new(
+        MockTransport::new(reads),
+        files,
+        Arc::new(LocalStore::new()),
+    );
 
     server.run(|_line| {}).await.unwrap();
     let transport = server.into_transport();
@@ -165,7 +180,11 @@ async fn file_range_aux_mid_file_read_is_silent_and_streams_requested_bytes() {
     // an auxiliary read, which is served as requested but stays silent.
     let ranges = range_read_parts(name, 5, 2);
     let reads = [ranges, vec![req(CMD_ID_EXIT, 0)]].concat();
-    let mut server = Server::new(MockTransport::new(reads), files);
+    let mut server = Server::new(
+        MockTransport::new(reads),
+        files,
+        Arc::new(LocalStore::new()),
+    );
 
     let mut logs = Vec::new();
     let mut completions = Vec::new();
@@ -226,7 +245,11 @@ async fn file_range_announces_a_file_once_and_completes_at_its_end() {
         vec![req(CMD_ID_EXIT, 0)],
     ]
     .concat();
-    let mut server = Server::new(MockTransport::new(reads), files);
+    let mut server = Server::new(
+        MockTransport::new(reads),
+        files,
+        Arc::new(LocalStore::new()),
+    );
 
     let mut logs = Vec::new();
     let mut completions = Vec::new();
@@ -268,7 +291,11 @@ async fn file_range_reannounces_a_re_read_file_and_reports_each_completion() {
         vec![req(CMD_ID_EXIT, 0)],
     ]
     .concat();
-    let mut server = Server::new(MockTransport::new(reads), files);
+    let mut server = Server::new(
+        MockTransport::new(reads),
+        files,
+        Arc::new(LocalStore::new()),
+    );
 
     let mut logs = Vec::new();
     let mut completions = Vec::new();
@@ -311,7 +338,11 @@ async fn streamed_phase_reports_progress_across_ranges_and_completes_once() {
         vec![req(CMD_ID_EXIT, 0)],
     ]
     .concat();
-    let mut server = Server::new(MockTransport::new(reads), files);
+    let mut server = Server::new(
+        MockTransport::new(reads),
+        files,
+        Arc::new(LocalStore::new()),
+    );
 
     let mut logs = Vec::new();
     let mut completions = Vec::new();
@@ -374,7 +405,11 @@ async fn dbi_preparation_sequence_keeps_aux_reads_silent_and_restarts_cleanly() 
         vec![req(CMD_ID_EXIT, 0)],
     ]
     .concat();
-    let mut server = Server::new(MockTransport::new(reads), files);
+    let mut server = Server::new(
+        MockTransport::new(reads),
+        files,
+        Arc::new(LocalStore::new()),
+    );
 
     let mut logs = Vec::new();
     let mut completions = Vec::new();
@@ -462,7 +497,11 @@ async fn file_range_with_unknown_file_ends_the_run() {
 
     let reads = vec![req(CMD_ID_FILE_RANGE, data_size), range_header, ack()];
     let files = FileList::new();
-    let mut server = Server::new(MockTransport::new(reads), files);
+    let mut server = Server::new(
+        MockTransport::new(reads),
+        files,
+        Arc::new(LocalStore::new()),
+    );
 
     let mut logs = Vec::new();
     let mut completions = Vec::new();
@@ -504,7 +543,11 @@ async fn unopenable_file_ends_the_run() {
     let data_size = range_header.len() as u32;
 
     let reads = vec![req(CMD_ID_FILE_RANGE, data_size), range_header, ack()];
-    let mut server = Server::new(MockTransport::new(reads), files);
+    let mut server = Server::new(
+        MockTransport::new(reads),
+        files,
+        Arc::new(LocalStore::new()),
+    );
 
     let mut logs = Vec::new();
     let err = server
@@ -539,7 +582,11 @@ async fn short_read_ends_the_run() {
     let data_size = range_header.len() as u32;
 
     let reads = vec![req(CMD_ID_FILE_RANGE, data_size), range_header, ack()];
-    let mut server = Server::new(MockTransport::new(reads), files);
+    let mut server = Server::new(
+        MockTransport::new(reads),
+        files,
+        Arc::new(LocalStore::new()),
+    );
 
     let mut logs = Vec::new();
     let err = server
@@ -563,7 +610,11 @@ async fn short_read_ends_the_run() {
 async fn oversized_file_range_header_is_rejected() {
     let files = FileList::new();
     let reads = vec![req(CMD_ID_FILE_RANGE, u32::MAX)];
-    let mut server = Server::new(MockTransport::new(reads), files);
+    let mut server = Server::new(
+        MockTransport::new(reads),
+        files,
+        Arc::new(LocalStore::new()),
+    );
 
     let mut logs = Vec::new();
     let err = server
@@ -607,7 +658,11 @@ async fn file_range_larger_than_one_chunk_is_streamed_in_multiple_writes() {
         ack(),
         req(CMD_ID_EXIT, 0),
     ];
-    let mut server = Server::new(MockTransport::new(reads), files);
+    let mut server = Server::new(
+        MockTransport::new(reads),
+        files,
+        Arc::new(LocalStore::new()),
+    );
     server.run(|_line| {}).await.unwrap();
     let transport = server.into_transport();
 
@@ -645,7 +700,11 @@ async fn file_range_reports_throttled_progress() {
         ack(),
         req(CMD_ID_EXIT, 0),
     ];
-    let mut server = Server::new(MockTransport::new(reads), files);
+    let mut server = Server::new(
+        MockTransport::new(reads),
+        files,
+        Arc::new(LocalStore::new()),
+    );
 
     let mut progress = Vec::new();
     server
@@ -668,4 +727,103 @@ async fn file_range_reports_throttled_progress() {
     assert_eq!(last.0, "big.nsp");
     assert_eq!(last.1, size as u64);
     assert_eq!(last.2, size as u64);
+}
+
+/// Serves exactly one share-sourced file out of memory, imitating an SMB
+/// store: listing fails, stat knows the file, open hands back its bytes.
+struct ShareFileStore {
+    loc: SmbLocation,
+    content: Arc<Vec<u8>>,
+}
+
+struct ShareFileReader {
+    content: Arc<Vec<u8>>,
+}
+
+#[async_trait]
+impl FileHandle for ShareFileReader {
+    async fn read_at(&mut self, buf: &mut [u8], offset: u64) -> Result<usize, SourceError> {
+        let start = offset as usize;
+        if start >= self.content.len() {
+            return Ok(0);
+        }
+        let end = (start + buf.len()).min(self.content.len());
+        buf[..end - start].copy_from_slice(&self.content[start..end]);
+        Ok(end - start)
+    }
+
+    async fn size(&self) -> Option<u64> {
+        Some(self.content.len() as u64)
+    }
+}
+
+#[async_trait]
+impl Sources for ShareFileStore {
+    async fn open(&self, source: &Source) -> Result<Box<dyn FileHandle>, SourceError> {
+        if source == &Source::Smb(self.loc.clone()) {
+            Ok(Box::new(ShareFileReader {
+                content: self.content.clone(),
+            }))
+        } else {
+            Err(SourceError::new(format!("no such file: {source}")))
+        }
+    }
+
+    async fn list_dir(&self, _source: &Source) -> Result<Vec<ListEntry>, SourceError> {
+        Err(SourceError::new("listing is not part of this test"))
+    }
+
+    async fn stat(&self, source: &Source) -> Result<Option<ListEntry>, SourceError> {
+        Ok(
+            (source == &Source::Smb(self.loc.clone())).then(|| ListEntry {
+                name: String::new(),
+                kind: dbi_backend_core::source::EntryKind::File,
+                size: self.content.len() as u64,
+            }),
+        )
+    }
+}
+
+#[tokio::test]
+async fn share_sourced_file_streams_from_its_range_and_completes() {
+    let content: Vec<u8> = (0..10u8).collect();
+    let loc = SmbLocation {
+        share: "nas".to_string(),
+        path: "switch/game.nsp".to_string(),
+    };
+
+    let mut files = FileList::new();
+    files.insert_source("game.nsp", Source::Smb(loc.clone()), 10);
+
+    // A mid-file read first, then the streamed whole-file pass.
+    let reads = [
+        range_read_parts("game.nsp", 5, 2),
+        range_read_parts("game.nsp", 10, 0),
+        vec![req(CMD_ID_EXIT, 0)],
+    ]
+    .concat();
+    let mut server = Server::new(
+        MockTransport::new(reads),
+        files,
+        Arc::new(ShareFileStore {
+            loc,
+            content: Arc::new(content.clone()),
+        }),
+    );
+
+    let mut completions = Vec::new();
+    server
+        .run(|update| {
+            if let ServerUpdate::Completed { name, bytes } = update {
+                completions.push((name, bytes));
+            }
+        })
+        .await
+        .unwrap();
+    let transport = server.into_transport();
+
+    // The mid-file range serves exactly the requested bytes of the share file.
+    assert_eq!(transport.writes[2], content[2..7]);
+    // The streamed pass participates fully: it completes like a local file.
+    assert_eq!(completions, vec![("game.nsp".to_string(), 10)]);
 }
