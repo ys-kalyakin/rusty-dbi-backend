@@ -24,11 +24,36 @@ dbi-backend ~/games
 dbi-backend game1.nsp game2.nsp
 ```
 
-Keys: `a` open the path picker, `c` clear the list, `s` start the server, `q`
-quit. While the server is running, `a` and `c` are disabled so the offered list
-matches the running server's snapshot. In the picker: `j`/`k` or the arrow keys
-move, `Enter` opens a directory or adds a file, `Space` adds the highlighted
-directory or file, `Backspace` goes up, and `Esc`/`q` cancels.
+Keys: `a` open the path picker, `c` clear the list, `s` start the server, `S`
+browse network shares, `q` quit. While the server is running, `a`, `c`, and `S`
+are disabled so the offered list matches the running server's snapshot. In the
+picker: `j`/`k` or the arrow keys move, `Enter` opens a directory or adds a
+file, `Space` adds the highlighted directory or file, `Backspace` goes up, and
+`Esc`/`q` cancels.
+
+## Share browsing
+
+Games can also install straight from an SMB share. Configure the shares in
+`~/.config/dbi-backend/config.toml` (create the directory if it is missing):
+
+```toml
+[[shares]]
+name = "nas"
+server = "192.0.2.4" # or host:port; the port defaults to 445
+share = "games"
+username = "you"
+# domain = "WORKGROUP" # optional
+# root = "library/switch" # optional: where browsing starts
+```
+
+The config never contains a password. Press `S` in the TUI to list the
+configured shares, pick one, and type its password. The password is asked at
+every share connection, kept in memory only, and never logged — connection
+failures name the share, not the secret. A successful connection opens the
+same file picker over the share (starting at `root` when set); added files
+show as share-qualified paths like `nas:/switch/game.nsp` and stream through
+the share when the Switch asks for them. Opening a stale session retries once;
+if the connection drops mid-transfer it is reported.
 
 ## Linux permissions
 

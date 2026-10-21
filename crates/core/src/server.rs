@@ -2,8 +2,10 @@
 
 use crate::filelist::FileList;
 use crate::protocol::*;
+use crate::source::Sources;
 use crate::transport::{Transport, TransportError};
 use std::collections::HashMap;
+use std::sync::Arc;
 
 /// Fatal errors from the command loop. Transport errors signal a lost connection.
 #[derive(Debug, thiserror::Error)]
@@ -47,16 +49,20 @@ struct StreamState {
 pub struct Server<T: Transport> {
     transport: T,
     files: FileList,
+    /// Opens files through their entries' sources: the local filesystem or a
+    /// store the caller wires in (a hub over connected shares later).
+    store: Arc<dyn Sources>,
     /// Streamed-sequence state per file, cleared when that file's streaming
     /// completes so a later re-read announces a fresh start.
     streams: HashMap<String, StreamState>,
 }
 
 impl<T: Transport> Server<T> {
-    pub fn new(transport: T, files: FileList) -> Self {
+    pub fn new(transport: T, files: FileList, store: Arc<dyn Sources>) -> Self {
         Self {
             transport,
             files,
+            store,
             streams: HashMap::new(),
         }
     }
@@ -125,8 +131,6 @@ impl<T: Transport> Server<T> {
         data_size: u32,
         log: &mut F,
     ) -> Result<(), ServerError> {
-        use std::io::{Read, Seek, SeekFrom};
-
         if data_size as usize > MAX_RANGE_HEADER_LEN {
             log(ServerUpdate::Log(format!(
                 "Range header too large: {data_size} bytes"
@@ -150,32 +154,16 @@ impl<T: Transport> Server<T> {
             log(ServerUpdate::Log(format!("Unknown file: {}", range.name)));
             return Err(ServerError::Range(format!("unknown file: {}", range.name)));
         };
-        let path = entry.path;
+        let source = entry.source.clone();
         let recorded_size = entry.size;
 
-        let mut file = match std::fs::File::open(&path) {
-            Ok(f) => f,
+        let mut handle = match self.store.open(&source).await {
+            Ok(handle) => handle,
             Err(e) => {
-                log(ServerUpdate::Log(format!(
-                    "Failed to open {}: {e}",
-                    path.display()
-                )));
-                return Err(ServerError::Range(format!(
-                    "failed to open {}: {e}",
-                    path.display()
-                )));
+                log(ServerUpdate::Log(format!("Failed to open {source}: {e}")));
+                return Err(ServerError::Range(format!("failed to open {source}: {e}")));
             }
         };
-        if let Err(e) = file.seek(SeekFrom::Start(range.range_offset)) {
-            log(ServerUpdate::Log(format!(
-                "Failed to seek {}: {e}",
-                path.display()
-            )));
-            return Err(ServerError::Range(format!(
-                "failed to seek {}: {e}",
-                path.display()
-            )));
-        }
 
         // Decide whether this range continues the file's streamed sequence: it
         // either starts the file at its first byte — opening a fresh sequence or
@@ -209,10 +197,9 @@ impl<T: Transport> Server<T> {
             log(ServerUpdate::Log(format!("Sending: {}", range.name)));
         }
 
-        let total = file
-            .metadata()
-            .map(|meta| meta.len())
-            .unwrap_or(recorded_size);
+        let total = handle.size().await.unwrap_or(recorded_size);
+        // `sent` doubles as the stream position: it starts at the requested
+        // offset and advances by the bytes actually served, exactly as before.
         let mut sent = range.range_offset;
         let mut last_percent = None;
 
@@ -220,28 +207,20 @@ impl<T: Transport> Server<T> {
         let mut buffer = vec![0u8; remaining.min(BUFFER_SEGMENT_DATA_SIZE)];
         while remaining > 0 {
             let to_read = remaining.min(BUFFER_SEGMENT_DATA_SIZE);
-            let n = match file.read(&mut buffer[..to_read]) {
+            let n = match handle.read_at(&mut buffer[..to_read], sent).await {
                 Ok(n) => n,
                 Err(e) => {
-                    log(ServerUpdate::Log(format!(
-                        "Read failed for {}: {e}",
-                        path.display()
-                    )));
-                    return Err(ServerError::Range(format!(
-                        "read failed for {}: {e}",
-                        path.display()
-                    )));
+                    log(ServerUpdate::Log(format!("Read failed for {source}: {e}")));
+                    return Err(ServerError::Range(format!("read failed for {source}: {e}")));
                 }
             };
             if n == 0 {
                 log(ServerUpdate::Log(format!(
-                    "Short transfer for {}: {} bytes remaining",
-                    path.display(),
+                    "Short transfer for {source}: {} bytes remaining",
                     remaining
                 )));
                 return Err(ServerError::Range(format!(
-                    "short transfer for {}: {remaining} bytes remaining",
-                    path.display()
+                    "short transfer for {source}: {remaining} bytes remaining"
                 )));
             }
             self.transport.write(&buffer[..n]).await?;

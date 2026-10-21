@@ -3,10 +3,12 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
-/// A single offered file: its resolved path and size in bytes.
+use crate::source::{EntryKind, Source, SourceError, Sources};
+
+/// A single offered file: where its bytes come from and its size in bytes.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
-    pub path: PathBuf,
+    pub source: Source,
     pub size: u64,
 }
 
@@ -21,8 +23,8 @@ pub struct FileList {
 pub struct AddOutcome {
     /// Names added to the list.
     pub added: Vec<String>,
-    /// Paths that could not be read and were skipped.
-    pub skipped: Vec<PathBuf>,
+    /// Sources that could not be read and were skipped.
+    pub skipped: Vec<Source>,
     /// Names that replaced a previously added entry.
     pub replaced: Vec<String>,
 }
@@ -32,13 +34,32 @@ impl FileList {
         Self::default()
     }
 
-    /// Insert an entry by name, returning the path it replaced, if any.
-    pub fn insert(&mut self, name: impl Into<String>, path: impl Into<PathBuf>) -> Option<PathBuf> {
+    /// Insert an entry by name, returning the source it replaced, if any.
+    pub fn insert(&mut self, name: impl Into<String>, path: impl Into<PathBuf>) -> Option<Source> {
         let path = path.into();
         let size = file_size(&path);
         self.files
-            .insert(name.into(), FileEntry { path, size })
-            .map(|entry| entry.path)
+            .insert(
+                name.into(),
+                FileEntry {
+                    source: Source::Local(path),
+                    size,
+                },
+            )
+            .map(|entry| entry.source)
+    }
+
+    /// Insert an exact entry: any source with a known size, no filesystem
+    /// access. Exercised by tests; share adds take `add_source` instead.
+    pub fn insert_source(
+        &mut self,
+        name: impl Into<String>,
+        source: Source,
+        size: u64,
+    ) -> Option<Source> {
+        self.files
+            .insert(name.into(), FileEntry { source, size })
+            .map(|entry| entry.source)
     }
 
     /// Add a file, or every `.nsp`/`.nsz` file found recursively under a directory.
@@ -64,7 +85,7 @@ impl FileList {
                     if first {
                         return Err(e);
                     }
-                    outcome.skipped.push(dir);
+                    outcome.skipped.push(Source::Local(dir));
                     continue;
                 }
             };
@@ -73,7 +94,7 @@ impl FileList {
                 let entry = match entry {
                     Ok(entry) => entry,
                     Err(_) => {
-                        outcome.skipped.push(dir.clone());
+                        outcome.skipped.push(Source::Local(dir.clone()));
                         continue;
                     }
                 };
@@ -81,7 +102,7 @@ impl FileList {
                 let file_type = match entry.file_type() {
                     Ok(file_type) => file_type,
                     Err(_) => {
-                        outcome.skipped.push(child);
+                        outcome.skipped.push(Source::Local(child));
                         continue;
                     }
                 };
@@ -106,19 +127,103 @@ impl FileList {
     }
 
     fn add_file(&mut self, path: &Path, outcome: &mut AddOutcome) {
-        let abs = path.canonicalize().unwrap_or_else(|_| path.to_path_buf());
-        if let Some(name) = path.file_name().and_then(|s| s.to_str()) {
-            let name = name.to_string();
-            let size = file_size(&abs);
+        let size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
+        self.record(Source::Local(path.to_path_buf()), size, outcome);
+    }
+
+    /// Record one entry under its file name, reporting a replacement when the
+    /// name was already present. Local sources resolve symlinks here, as the
+    /// old path-based add always did.
+    fn record(&mut self, source: Source, size: u64, outcome: &mut AddOutcome) {
+        let resolved = match source {
+            Source::Local(path) => {
+                Source::Local(path.canonicalize().unwrap_or_else(|_| path.clone()))
+            }
+            other => other,
+        };
+        if let Some(name) = resolved.file_name() {
             if self
                 .files
-                .insert(name.clone(), FileEntry { path: abs, size })
+                .insert(
+                    name.clone(),
+                    FileEntry {
+                        source: resolved,
+                        size,
+                    },
+                )
                 .is_some()
             {
                 outcome.replaced.push(name.clone());
             }
             outcome.added.push(name);
         }
+    }
+
+    /// Add one file, or a scanned directory, from any source. Carries
+    /// [`FileList::add_path`]'s semantics over share listings: a directly
+    /// added file is unfiltered, a directory is scanned recursively and
+    /// filtered, unreadable parts are skipped and reported, and sizes come
+    /// from the listings. A missing or unreadable root is an error.
+    pub async fn add_source(
+        &mut self,
+        store: &dyn Sources,
+        source: &Source,
+    ) -> Result<AddOutcome, SourceError> {
+        let Some(stat) = store.stat(source).await? else {
+            return Err(SourceError::new(format!("no such path: {source}")));
+        };
+        let mut outcome = AddOutcome::default();
+        match stat.kind {
+            EntryKind::File => {
+                self.record(source.clone(), stat.size, &mut outcome);
+            }
+            EntryKind::Dir => {
+                self.scan_dir(store, source, &mut outcome, true).await?;
+            }
+        }
+        Ok(outcome)
+    }
+
+    /// List one directory, add its matching files, and descend into every
+    /// subdirectory. Only the root's listing failure is fatal.
+    async fn scan_dir(
+        &mut self,
+        store: &dyn Sources,
+        dir: &Source,
+        outcome: &mut AddOutcome,
+        root: bool,
+    ) -> Result<(), SourceError> {
+        let entries = match store.list_dir(dir).await {
+            Ok(entries) => entries,
+            Err(e) => {
+                if root {
+                    return Err(e);
+                }
+                outcome.skipped.push(dir.clone());
+                return Ok(());
+            }
+        };
+        let mut stack = Vec::new();
+        for entry in entries {
+            // A self or parent entry refers to the walked directory itself;
+            // descending through one, however the listing reports it, would
+            // never end.
+            if entry.name == "." || entry.name == ".." {
+                continue;
+            }
+            let child = dir.join(&entry.name);
+            match entry.kind {
+                EntryKind::Dir => stack.push(child),
+                EntryKind::File if has_target_ext(Path::new(&entry.name)) => {
+                    self.record(child, entry.size, outcome);
+                }
+                EntryKind::File => {}
+            }
+        }
+        for sub in stack {
+            Box::pin(self.scan_dir(store, &sub, outcome, false)).await?;
+        }
+        Ok(())
     }
 
     pub fn clear(&mut self) {
@@ -251,14 +356,17 @@ mod tests {
         list.insert("a", "/1");
         list.insert("a", "/2");
         assert_eq!(list.len(), 1);
-        assert_eq!(list.get("a").unwrap().path, PathBuf::from("/2"));
+        assert_eq!(list.get("a").unwrap().source.to_string(), "/2");
     }
 
     #[test]
-    fn insert_returns_the_replaced_path() {
+    fn insert_returns_the_replaced_source() {
         let mut list = FileList::new();
         assert_eq!(list.insert("a", "/1"), None);
-        assert_eq!(list.insert("a", "/2"), Some(PathBuf::from("/1")));
+        assert_eq!(
+            list.insert("a", "/2"),
+            Some(Source::Local(PathBuf::from("/1")))
+        );
     }
 
     #[test]
@@ -348,6 +456,267 @@ mod tests {
 
         assert!(list.get("ok.nsp").is_some());
         assert!(list.get("hidden.nsp").is_none());
-        assert!(outcome.skipped.iter().any(|p| p.ends_with("locked")));
+        assert!(outcome
+            .skipped
+            .iter()
+            .any(|s| s.to_string().ends_with("locked")));
+    }
+
+    /// Tests for [`FileList::add_source`], running against [`MemStore`] and a
+    /// small wrapper that can deny listings like an unreadable share directory.
+    #[cfg(feature = "test-util")]
+    mod add_source_tests {
+        use super::*;
+        use crate::source::local::LocalStore;
+        use crate::source::testutil::MemStore;
+        use crate::source::{EntryKind, FileHandle, ListEntry, SmbLocation};
+        use async_trait::async_trait;
+
+        fn smb(share: &str, path: &str) -> Source {
+            Source::Smb(SmbLocation {
+                share: share.to_string(),
+                path: path.to_string(),
+            })
+        }
+
+        /// Delegates everything to `MemStore` except listing the denied
+        /// source, which fails the way an unreadable directory would.
+        struct DenyDir {
+            inner: MemStore,
+            deny: Source,
+        }
+
+        #[async_trait]
+        impl Sources for DenyDir {
+            async fn open(&self, source: &Source) -> Result<Box<dyn FileHandle>, SourceError> {
+                self.inner.open(source).await
+            }
+
+            async fn list_dir(&self, source: &Source) -> Result<Vec<ListEntry>, SourceError> {
+                if *source == self.deny {
+                    Err(SourceError::new(format!("denied: {source}")))
+                } else {
+                    self.inner.list_dir(source).await
+                }
+            }
+
+            async fn stat(&self, source: &Source) -> Result<Option<ListEntry>, SourceError> {
+                self.inner.stat(source).await
+            }
+        }
+
+        #[tokio::test]
+        async fn add_source_scans_a_share_directory_recursively() {
+            let store = MemStore::new();
+            store.add_file(&smb("games", "switch/z.nsp"), b"zzz" as &[u8]);
+            store.add_file(&smb("games", "switch/sub/a.nsz"), b"a" as &[u8]);
+
+            let mut list = FileList::new();
+            let outcome = list
+                .add_source(&store, &smb("games", "switch"))
+                .await
+                .unwrap();
+
+            assert_eq!(list.len(), 2);
+            assert_eq!(
+                list.get("a.nsz").unwrap().source,
+                smb("games", "switch/sub/a.nsz")
+            );
+            assert_eq!(list.get("a.nsz").unwrap().size, 1);
+            assert_eq!(
+                list.get("z.nsp").unwrap().source,
+                smb("games", "switch/z.nsp")
+            );
+            assert_eq!(list.get("z.nsp").unwrap().size, 3);
+            assert!(outcome.skipped.is_empty());
+        }
+
+        #[tokio::test]
+        async fn add_source_filters_scan_results_by_extension() {
+            let store = MemStore::new();
+            store.add_file(&smb("nas", "archive/game.nsp"), b"x" as &[u8]);
+            store.add_file(&smb("nas", "archive/README.TXT"), b"x" as &[u8]);
+
+            let mut list = FileList::new();
+            let outcome = list
+                .add_source(&store, &smb("nas", "archive"))
+                .await
+                .unwrap();
+
+            assert_eq!(outcome.added, vec!["game.nsp".to_string()]);
+            assert!(list.get("README.TXT").is_none());
+        }
+
+        #[tokio::test]
+        async fn add_source_adds_a_directly_listed_file_without_filtering() {
+            let store = MemStore::new();
+            store.add_file(&smb("nas", "readme.txt"), b"hello" as &[u8]);
+
+            let mut list = FileList::new();
+            let outcome = list
+                .add_source(&store, &smb("nas", "readme.txt"))
+                .await
+                .unwrap();
+
+            assert_eq!(outcome.added, vec!["readme.txt".to_string()]);
+            assert_eq!(list.get("readme.txt").unwrap().size, 5);
+            assert_eq!(
+                list.get("readme.txt").unwrap().source,
+                smb("nas", "readme.txt")
+            );
+        }
+
+        #[tokio::test]
+        async fn add_source_reports_skipped_subdirectories() {
+            let inner = MemStore::new();
+            inner.add_file(&smb("games", "switch/a.nsp"), b"a" as &[u8]);
+            // The file makes `locked` show up as a directory in the listing,
+            // where DenyDir then denies descending into it.
+            inner.add_file(&smb("games", "switch/locked/hidden.nsp"), b"h" as &[u8]);
+            let denied = smb("games", "switch/locked");
+            let store = DenyDir {
+                inner,
+                deny: denied.clone(),
+            };
+
+            let mut list = FileList::new();
+            let outcome = list
+                .add_source(&store, &smb("games", "switch"))
+                .await
+                .unwrap();
+
+            assert!(list.get("a.nsp").is_some());
+            assert_eq!(outcome.skipped, vec![denied]);
+        }
+
+        #[tokio::test]
+        async fn add_source_errors_on_a_missing_root() {
+            let store = MemStore::new();
+            let mut list = FileList::new();
+
+            let err = list
+                .add_source(&store, &smb("games", "nowhere"))
+                .await
+                .err()
+                .unwrap();
+
+            assert_eq!(err.message, "no such path: games:/nowhere");
+        }
+
+        #[tokio::test]
+        async fn add_source_adds_a_local_file_directly() {
+            let dir = tempfile::tempdir().unwrap();
+            fs::write(dir.path().join("readme.nsp"), b"r").unwrap();
+
+            let mut list = FileList::new();
+            let outcome = list
+                .add_source(
+                    &LocalStore::new(),
+                    &Source::Local(dir.path().join("readme.nsp")),
+                )
+                .await
+                .unwrap();
+
+            assert_eq!(outcome.added, vec!["readme.nsp".to_string()]);
+            assert_eq!(list.get("readme.nsp").unwrap().size, 1);
+        }
+
+        /// Delegates to [`MemStore`] but appends the self and parent
+        /// pseudo-entries to every listing the way a share server does, and
+        /// optionally reports one source as an existing (empty) directory so
+        /// a listing can hold nothing real.
+        struct DotServer {
+            inner: MemStore,
+            dir_root: Option<Source>,
+        }
+
+        #[async_trait]
+        impl Sources for DotServer {
+            async fn open(&self, source: &Source) -> Result<Box<dyn FileHandle>, SourceError> {
+                self.inner.open(source).await
+            }
+
+            async fn list_dir(&self, source: &Source) -> Result<Vec<ListEntry>, SourceError> {
+                let mut entries = self.inner.list_dir(source).await?;
+                let mut dots = vec![
+                    ListEntry {
+                        name: ".".to_string(),
+                        kind: EntryKind::Dir,
+                        size: 0,
+                    },
+                    ListEntry {
+                        name: "..".to_string(),
+                        kind: EntryKind::Dir,
+                        size: 0,
+                    },
+                ];
+                entries.append(&mut dots);
+                Ok(entries)
+            }
+
+            async fn stat(&self, source: &Source) -> Result<Option<ListEntry>, SourceError> {
+                if self.dir_root.as_ref().is_some_and(|root| root == source) {
+                    return Ok(Some(ListEntry {
+                        name: String::new(),
+                        kind: EntryKind::Dir,
+                        size: 0,
+                    }));
+                }
+                self.inner.stat(source).await
+            }
+        }
+
+        /// Scanning a share directory must ignore the `.` and `..` entries a
+        /// listing reports as directories: descending into them can only loop
+        /// forever, whatever the walker does.
+        #[tokio::test]
+        async fn add_source_ignores_dot_pseudo_entries_in_listings() {
+            let inner = MemStore::new();
+            inner.add_file(&smb("games", "switch/a.nsp"), b"a" as &[u8]);
+            inner.add_file(&smb("games", "switch/sub/b.nsz"), b"b" as &[u8]);
+            let store = DotServer {
+                inner,
+                dir_root: None,
+            };
+
+            let mut list = FileList::new();
+            let outcome = list
+                .add_source(&store, &smb("games", "switch"))
+                .await
+                .unwrap();
+
+            assert_eq!(
+                outcome.added,
+                vec!["a.nsp".to_string(), "b.nsz".to_string()]
+            );
+            assert_eq!(
+                list.get("a.nsp").unwrap().source,
+                smb("games", "switch/a.nsp")
+            );
+            assert_eq!(list.get("a.nsp").unwrap().size, 1);
+            assert_eq!(
+                list.get("b.nsz").unwrap().source,
+                smb("games", "switch/sub/b.nsz")
+            );
+            assert!(outcome.skipped.is_empty());
+        }
+
+        /// A directory whose listing holds nothing but `.` and `..` adds
+        /// nothing and still terminates normally.
+        #[tokio::test]
+        async fn add_source_of_a_dot_only_listing_adds_nothing() {
+            let root = smb("games", "empty");
+            let store = DotServer {
+                inner: MemStore::new(),
+                dir_root: Some(root.clone()),
+            };
+
+            let mut list = FileList::new();
+            let outcome = list.add_source(&store, &root).await.unwrap();
+
+            assert!(list.is_empty());
+            assert!(outcome.added.is_empty());
+            assert!(outcome.skipped.is_empty());
+        }
     }
 }

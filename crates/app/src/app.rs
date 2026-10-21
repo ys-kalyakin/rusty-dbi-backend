@@ -2,13 +2,17 @@
 
 use std::collections::VecDeque;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+use crate::config;
+use crate::config::ShareConfig;
 use crate::picker::{Kind, Picker};
 use crate::theme;
-use crossterm::event::{KeyCode, KeyEvent, KeyEventKind};
-use dbi_backend_core::filelist::FileList;
+use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
+use dbi_backend_core::filelist::{AddOutcome, FileList};
 use dbi_backend_core::server::{Server, ServerUpdate};
+use dbi_backend_core::source::{ListEntry, Source, SourceError, Sources};
 use dbi_backend_core::transport::usb::UsbTransport;
 use ratatui::layout::{Alignment, Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -34,11 +38,27 @@ pub enum ServerStatus {
 }
 
 /// What the caller should do after a key press.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Action {
     None,
     Start,
     Quit,
+    /// Connect to a share by display name with its typed password. Closing
+    /// this action drops the password; the hub is the only holder afterwards.
+    Connect {
+        share: String,
+        password: String,
+        selection: usize,
+    },
+    /// List a share directory through the store (the picker asked for it).
+    List(Source),
+    /// Add a share-sourced path to the file list (needs the store).
+    Add(Source),
+    /// Register a share the add form built: connectable at once in the same
+    /// run and saved to the config file by the caller. No password is carried.
+    AddShare {
+        config: ShareConfig,
+    },
 }
 
 /// A lifecycle or progress transition reported by the background server task.
@@ -69,9 +89,150 @@ pub enum ConfirmKind {
 /// Which view is active.
 pub enum Mode {
     Normal,
+    Shares(ShareList),
+    Password(PasswordModal),
     Picker(Picker),
+    ShareForm(ShareFormState),
     Confirm(ConfirmKind),
     Help,
+}
+
+/// The add-share form's field order: display name, SMB server, share, login
+/// username, optional domain, and optional browsable root. No field is a
+/// password and none is masked — passwords are never asked here.
+pub const SHARE_FORM_FIELDS: usize = 6;
+const FIELD_NAME: usize = 0;
+const FIELD_SERVER: usize = 1;
+const FIELD_SHARE: usize = 2;
+const FIELD_USERNAME: usize = 3;
+const FIELD_DOMAIN: usize = 4;
+const FIELD_ROOT: usize = 5;
+
+/// The add-share dialog state: six labeled buffers in field order, the focused
+/// field, the errors from the last submit, and the share-list selection to
+/// return to on Esc. Validation happens in `config::build_share`.
+pub struct ShareFormState {
+    buffers: [String; SHARE_FORM_FIELDS],
+    focus: usize,
+    errors: Vec<String>,
+    return_to: usize,
+}
+
+impl ShareFormState {
+    /// The empty form with the focus on the first field.
+    pub fn open(return_to: usize) -> Self {
+        Self {
+            buffers: Default::default(),
+            focus: 0,
+            errors: Vec::new(),
+            return_to,
+        }
+    }
+
+    /// Type into the focused field.
+    pub fn push(&mut self, c: char) {
+        self.buffers[self.focus].push(c);
+    }
+
+    /// Erase the focused field's last typed character.
+    pub fn pop(&mut self) {
+        self.buffers[self.focus].pop();
+    }
+
+    pub fn next_field(&mut self) {
+        if self.focus + 1 < SHARE_FORM_FIELDS {
+            self.focus += 1;
+        }
+    }
+
+    pub fn previous_field(&mut self) {
+        self.focus = self.focus.saturating_sub(1);
+    }
+
+    pub fn focus(&self) -> usize {
+        self.focus
+    }
+
+    pub fn field_value(&self, field: usize) -> &str {
+        &self.buffers[field]
+    }
+
+    /// The share-list selection Esc returns to.
+    pub fn return_selection(&self) -> usize {
+        self.return_to
+    }
+
+    pub fn set_errors(&mut self, errors: Vec<String>) {
+        self.errors = errors;
+    }
+
+    pub fn errors(&self) -> &[String] {
+        &self.errors
+    }
+
+    /// Validate the typed values against the names already configured; the
+    /// same rules the config loader applies.
+    pub fn build(&self, existing_names: &[String]) -> Result<ShareConfig, Vec<String>> {
+        config::build_share(
+            &self.buffers[FIELD_NAME],
+            &self.buffers[FIELD_SERVER],
+            &self.buffers[FIELD_SHARE],
+            &self.buffers[FIELD_USERNAME],
+            &self.buffers[FIELD_DOMAIN],
+            &self.buffers[FIELD_ROOT],
+            existing_names,
+        )
+    }
+}
+
+/// The share list view state: which configured share is highlighted.
+pub struct ShareList {
+    pub selected: usize,
+}
+
+impl ShareList {
+    pub fn open() -> Self {
+        Self { selected: 0 }
+    }
+}
+
+/// The password modal for one share: the display name and the typed buffer,
+/// always rendered masked. The buffer is emptied on submit; the password
+/// travels in the [`Action::Connect`] and lives on inside the hub only.
+pub struct PasswordModal {
+    pub share: String,
+    password: String,
+}
+
+impl PasswordModal {
+    pub fn for_share(share: &str) -> Self {
+        Self {
+            share: share.to_string(),
+            password: String::new(),
+        }
+    }
+
+    pub fn push(&mut self, c: char) {
+        self.password.push(c);
+    }
+
+    pub fn pop(&mut self) {
+        self.password.pop();
+    }
+
+    /// The typed password, if any; the modal's buffer is emptied either way.
+    pub fn take(&mut self) -> Option<String> {
+        if self.password.is_empty() {
+            None
+        } else {
+            Some(std::mem::take(&mut self.password))
+        }
+    }
+
+    /// How many mask characters to render.
+    pub fn typed_len(&self) -> usize {
+        self.password.len()
+    }
 }
 
 /// A retained log line with its age relative to application start.
@@ -104,12 +265,25 @@ pub struct App {
     pub should_quit: bool,
     pub selected: usize,
     pub progress: Option<ProgressState>,
+    /// Configured shares for the share list, sorted by display name.
+    pub shares: Vec<ShareConfig>,
+    /// Where the config file lives, for the empty-share-list hint.
+    pub config_hint: Option<PathBuf>,
     server_started: bool,
     started_at: Instant,
 }
 
 impl App {
+    /// The plain constructor: no shares configured. Also the test harness's
+    /// default, hence the dead-code allowance for the server-only binary.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn new(files: FileList) -> Self {
+        Self::with_shares(files, Vec::new())
+    }
+
+    /// An app that knows the configured shares for the share list view.
+    pub fn with_shares(files: FileList, mut shares: Vec<ShareConfig>) -> Self {
+        shares.sort_by(|a, b| a.name.cmp(&b.name));
         Self {
             files,
             log: VecDeque::new(),
@@ -118,6 +292,8 @@ impl App {
             should_quit: false,
             selected: 0,
             progress: None,
+            shares,
+            config_hint: config::config_path(),
             server_started: false,
             started_at: Instant::now(),
         }
@@ -236,10 +412,7 @@ impl App {
             Ok(outcome) => {
                 self.push_log(format!("Added: {}", path.display()));
                 for skipped in &outcome.skipped {
-                    self.push_log(format!(
-                        "Warning: skipped {}: cannot be read",
-                        skipped.display()
-                    ));
+                    self.push_log(format!("Warning: skipped {skipped}: cannot be read"));
                 }
                 for replaced in &outcome.replaced {
                     self.push_log(format!(
@@ -253,16 +426,20 @@ impl App {
         self.clamp_selection();
     }
 
-    fn handle_picker_key(&mut self, key: KeyEvent) {
+    /// Picker keys. Local adds close the picker inline; share adds and share
+    /// listings come back as async actions for the caller to run.
+    fn handle_picker_key(&mut self, key: KeyEvent) -> Action {
         enum Outcome {
             None,
-            Select(PathBuf),
+            Select(Source),
+            /// Request a store listing for this share directory.
+            List(Source),
             Cancel,
         }
 
         let outcome = {
             let Mode::Picker(picker) = &mut self.mode else {
-                return;
+                return Action::None;
             };
             if picker.is_filtering() {
                 match key.code {
@@ -308,23 +485,30 @@ impl App {
                         Outcome::None
                     }
                     KeyCode::Char(' ') => match picker.current() {
-                        Some(entry) => Outcome::Select(entry.path.clone()),
+                        Some(entry) => Outcome::Select(entry.source.clone()),
                         None => Outcome::None,
                     },
                     KeyCode::Enter => {
                         if picker.current().map(|e| e.kind) == Some(Kind::Dir) {
                             picker.descend();
-                            Outcome::None
+                            // Only share origins list asynchronously.
+                            match picker.reload_request() {
+                                Some(source) => Outcome::List(source),
+                                None => Outcome::None,
+                            }
                         } else {
                             match picker.current() {
-                                Some(entry) => Outcome::Select(entry.path.clone()),
+                                Some(entry) => Outcome::Select(entry.source.clone()),
                                 None => Outcome::None,
                             }
                         }
                     }
                     KeyCode::Backspace | KeyCode::Left | KeyCode::Char('h') => {
-                        picker.go_up();
-                        Outcome::None
+                        if let Some(source) = picker.go_up() {
+                            Outcome::List(source)
+                        } else {
+                            Outcome::None
+                        }
                     }
                     KeyCode::Esc | KeyCode::Char('q') => Outcome::Cancel,
                     _ => Outcome::None,
@@ -333,9 +517,24 @@ impl App {
         };
 
         match outcome {
-            Outcome::Select(path) => self.select_path(&path),
-            Outcome::Cancel => self.mode = Mode::Normal,
-            Outcome::None => {}
+            Outcome::Select(source) => match source {
+                // Local adds complete instantly; share adds need the store.
+                Source::Local(path) => {
+                    self.select_path(&path);
+                    Action::None
+                }
+                share => {
+                    self.mode = Mode::Normal;
+                    self.clamp_selection();
+                    Action::Add(share)
+                }
+            },
+            Outcome::List(source) => Action::List(source),
+            Outcome::Cancel => {
+                self.mode = Mode::Normal;
+                Action::None
+            }
+            Outcome::None => Action::None,
         }
     }
 
@@ -399,8 +598,17 @@ impl App {
 
         match &self.mode {
             Mode::Picker(_) => {
-                self.handle_picker_key(key);
+                return self.handle_picker_key(key);
+            }
+            Mode::Shares(_) => {
+                self.handle_shares_key(key);
                 return Action::None;
+            }
+            Mode::Password(_) => {
+                return self.handle_password_key(key);
+            }
+            Mode::ShareForm(_) => {
+                return self.handle_share_form_key(key);
             }
             Mode::Confirm(kind) => {
                 let kind = *kind;
@@ -469,8 +677,241 @@ impl App {
                     Action::None
                 }
             }
+            KeyCode::Char('S') => {
+                if !running {
+                    self.mode = Mode::Shares(ShareList::open());
+                }
+                Action::None
+            }
             _ => Action::None,
         }
+    }
+
+    /// Keys of the share list view: move the highlight, open the password
+    /// modal for the selected share on Enter, open the add-share form with
+    /// `a`, cancel back to normal. Nothing connects from this view itself —
+    /// cancelling connects to nothing at all.
+    fn handle_shares_key(&mut self, key: KeyEvent) {
+        let Mode::Shares(list) = &mut self.mode else {
+            return;
+        };
+        match key.code {
+            KeyCode::Char('j') | KeyCode::Down => {
+                if !self.shares.is_empty() {
+                    list.selected = (list.selected + 1).min(self.shares.len() - 1);
+                }
+            }
+            KeyCode::Char('k') | KeyCode::Up => {
+                list.selected = list.selected.saturating_sub(1);
+            }
+            KeyCode::Enter => {
+                if let Some(share) = self.shares.get(list.selected).map(|s| s.name.clone()) {
+                    self.mode = Mode::Password(PasswordModal::for_share(&share));
+                }
+            }
+            KeyCode::Char('a') => {
+                self.mode = Mode::ShareForm(ShareFormState::open(list.selected));
+            }
+            KeyCode::Esc | KeyCode::Char('q') => {
+                self.mode = Mode::Normal;
+            }
+            _ => {}
+        }
+    }
+
+    /// Keys of the add-share form: type into the focused field, arrows and Tab
+    /// move the focus between fields, Esc cancels back to the share list. No
+    /// field asks for or masks a password.
+    fn handle_share_form_key(&mut self, key: KeyEvent) -> Action {
+        let Mode::ShareForm(form) = &mut self.mode else {
+            return Action::None;
+        };
+        match key.code {
+            KeyCode::Char(c) if c.is_ascii_graphic() || c == ' ' || !c.is_control() => {
+                form.push(c);
+            }
+            KeyCode::Backspace => {
+                form.pop();
+            }
+            KeyCode::Tab => {
+                if key.modifiers.contains(KeyModifiers::SHIFT) {
+                    form.previous_field();
+                } else {
+                    form.next_field();
+                }
+            }
+            KeyCode::Down => {
+                form.next_field();
+            }
+            KeyCode::Up => {
+                form.previous_field();
+            }
+            KeyCode::Enter => {
+                let names: Vec<String> = self.shares.iter().map(|s| s.name.clone()).collect();
+                match form.build(&names) {
+                    Ok(config) => {
+                        // The form stays open until the caller has registered
+                        // the share and brought the share list back up.
+                        return Action::AddShare { config };
+                    }
+                    Err(errors) => form.set_errors(errors),
+                }
+            }
+            KeyCode::Esc => {
+                let return_to = form.return_selection();
+                self.mode = Mode::Shares(ShareList {
+                    selected: return_to,
+                });
+            }
+            _ => {}
+        }
+        Action::None
+    }
+
+    /// Keys of the password modal: type printable keys, Enter submits (via
+    /// [`Action::Connect`]), Esc cancels leaving the share disconnected.
+    fn handle_password_key(&mut self, key: KeyEvent) -> Action {
+        let Mode::Password(modal) = &mut self.mode else {
+            return Action::None;
+        };
+        match key.code {
+            KeyCode::Char(c) if c.is_ascii_graphic() || c == ' ' || !c.is_control() => {
+                modal.push(c);
+                Action::None
+            }
+            KeyCode::Backspace => {
+                modal.pop();
+                Action::None
+            }
+            KeyCode::Enter => {
+                let Some(password) = modal.take() else {
+                    return Action::None;
+                };
+                let share = modal.share.clone();
+                let selection = self
+                    .shares
+                    .iter()
+                    .position(|s| s.name == share)
+                    .unwrap_or(0);
+                self.mode = Mode::Shares(ShareList {
+                    selected: selection,
+                });
+                Action::Connect {
+                    share,
+                    password,
+                    selection,
+                }
+            }
+            KeyCode::Esc => {
+                let share = modal.share.clone();
+                let selection = self
+                    .shares
+                    .iter()
+                    .position(|s| s.name == share)
+                    .unwrap_or(0);
+                self.mode = Mode::Shares(ShareList {
+                    selected: selection,
+                });
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// The configured share by display name, for the picker's browsable root.
+    pub fn share_config(&self, name: &str) -> Option<&ShareConfig> {
+        self.shares.iter().find(|config| config.name == name)
+    }
+
+    /// Register a share the add form built: inserted among the sorted shares
+    /// (replacing a same-named entry defensively, as the hub does), with the
+    /// share list brought back up and the highlight on the added share.
+    /// Returns that share's position in the list.
+    pub fn share_added(&mut self, config: ShareConfig) -> usize {
+        let position = self
+            .shares
+            .iter()
+            .position(|other| other.name >= config.name)
+            .unwrap_or(self.shares.len());
+        if self
+            .shares
+            .get(position)
+            .is_some_and(|s| s.name == config.name)
+        {
+            self.shares.remove(position);
+        }
+        self.shares.insert(position, config);
+        self.mode = Mode::Shares(ShareList { selected: position });
+        position
+    }
+
+    /// The app's answer to a failed share connection: stay on the share list
+    /// (the caller logged the failure) and keep the share there for a retry.
+    pub fn share_connection_failed(&mut self, share: &str) {
+        let selection = self
+            .shares
+            .iter()
+            .position(|s| s.name == share)
+            .unwrap_or(0);
+        self.mode = Mode::Shares(ShareList {
+            selected: selection,
+        });
+    }
+
+    /// A successful connection opens the picker at the share root. Its first
+    /// listing is still pending: callers resolve it through
+    /// [`App::pending_share_list`].
+    pub fn open_share_picker(&mut self, share: &str, root: &str) {
+        self.mode = Mode::Picker(Picker::at_share(share, root));
+    }
+
+    /// The listing the open share picker currently waits for.
+    pub fn pending_share_list(&self) -> Option<Source> {
+        match &self.mode {
+            Mode::Picker(picker) => picker.reload_request(),
+            _ => None,
+        }
+    }
+
+    /// Apply a store listing to the open share picker.
+    pub fn apply_share_listing(&mut self, source: &Source, result: Vec<ListEntry>) {
+        let Mode::Picker(picker) = &mut self.mode else {
+            return;
+        };
+        let Source::Smb(location) = source else {
+            return;
+        };
+        picker.apply_share_listing(location, result);
+    }
+
+    /// Record a share listing failure: the picker shows the error and calms.
+    pub fn share_listing_failed(&mut self, source: &Source, error: &str) {
+        let Mode::Picker(picker) = &mut self.mode else {
+            return;
+        };
+        if picker.is_busy() || picker.entries().is_empty() {
+            picker.set_error(format!("cannot list {source}: {error}"));
+        }
+    }
+
+    /// Log the outcome of an add, whether sync (local) or awaited (share).
+    pub fn log_add_outcome(&mut self, display: &str, outcome: &AddOutcome) {
+        self.push_log(format!("Added: {display}"));
+        for skipped in &outcome.skipped {
+            self.push_log(format!("Warning: skipped {skipped}: cannot be read"));
+        }
+        for replaced in &outcome.replaced {
+            self.push_log(format!(
+                "Warning: {replaced} replaced a previously added file"
+            ));
+        }
+        self.clamp_selection();
+    }
+
+    /// Log a failed add.
+    pub fn log_add_failure(&mut self, display: &str, error: &SourceError) {
+        self.push_log(format!("Cannot add {display}: {error}"));
+        self.clamp_selection();
     }
 }
 
@@ -517,6 +958,7 @@ impl ConnectLog {
 /// transitions and progress to `event_tx`.
 pub fn spawn_server(
     files: FileList,
+    store: Arc<dyn Sources>,
     log_tx: UnboundedSender<String>,
     event_tx: UnboundedSender<ServerEvent>,
 ) {
@@ -540,7 +982,7 @@ pub fn spawn_server(
             let _ = log_tx.send("Switch connected".into());
             let _ = event_tx.send(ServerEvent::Started);
 
-            let mut server = Server::new(transport, files.clone());
+            let mut server = Server::new(transport, files.clone(), store.clone());
             let log = log_tx.clone();
             let events = event_tx.clone();
             let mut on_update = move |update: ServerUpdate| match update {
@@ -573,26 +1015,33 @@ pub fn spawn_server(
 /// Hint line shown while the picker is open.
 const PICKER_HINT: &str = "Esc cancel  Enter open  Space add  Bksp up  / filter";
 
+/// Hint line shown while the share list is open.
+const SHARES_HINT: &str = "Esc cancel  Enter connect  a add share";
+
+/// Hint line shown while the add-share form is open.
+const SHARE_FORM_HINT: &str = "Tab next  Enter save  Esc cancel";
+
 /// The normal-view hint broken into keyed chip pairs: bracketed key text, label
 /// remainder, and the key character (for locked-out detection).
-const NORMAL_ACTIONS: [(&str, &str, char); 6] = [
+const NORMAL_ACTIONS: [(&str, &str, char); 7] = [
     ("[a]", "dd", 'a'),
     ("[d]", "elete", 'd'),
     ("[c]", "lear", 'c'),
     ("[s]", "tart", 's'),
+    ("[S]", "hares", 'S'),
     ("[q]", "uit", 'q'),
     ("[?]", " help", '?'),
 ];
 
 /// The normal-mode hint as keyed chips. While the server task is active the
-/// locked-out editing keys (`a`/`d`/`c`) are rendered dimmed.
+/// locked-out editing keys (`a`/`d`/`c`/`S`) are rendered dimmed.
 fn normal_hint_line(server_active: bool) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::new();
     for (index, (key, label, key_char)) in NORMAL_ACTIONS.iter().enumerate() {
         if index > 0 {
             spans.push(Span::raw("  "));
         }
-        let locked = server_active && matches!(key_char, 'a' | 'd' | 'c');
+        let locked = server_active && matches!(key_char, 'a' | 'd' | 'c' | 'S');
         if locked {
             spans.push(Span::styled(key.to_string(), theme::muted_dim()));
             spans.push(Span::styled(label.to_string(), theme::muted_dim()));
@@ -628,6 +1077,12 @@ pub fn ui(frame: &mut Frame, app: &App) {
             render_log(frame, app, chunks[2]);
             render_help(frame, app, chunks[3]);
         }
+        Mode::Shares(list) => {
+            // Same for the share list: only reachable while the server is idle.
+            render_shares(frame, app, list, chunks[1]);
+            render_log(frame, app, chunks[2]);
+            render_help(frame, app, chunks[3]);
+        }
         _ => {
             render_files(frame, app, chunks[1]);
             let mut log_index = 2;
@@ -643,6 +1098,8 @@ pub fn ui(frame: &mut Frame, app: &App) {
     match &app.mode {
         Mode::Confirm(kind) => render_confirm(frame, *kind, area),
         Mode::Help => render_help_overlay(frame, area),
+        Mode::Password(modal) => render_password(frame, modal, area),
+        Mode::ShareForm(form) => render_share_form(frame, form, area),
         _ => {}
     }
 }
@@ -709,7 +1166,7 @@ fn render_files(frame: &mut Frame, app: &App, area: Rect) {
                 ),
                 Cell::from(Span::styled(
                     abbrev_path(
-                        &entry.path.display().to_string(),
+                        &entry.source.to_string(),
                         (area.width as usize).saturating_sub(20),
                     ),
                     theme::muted(),
@@ -835,6 +1292,9 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
             "Press y to confirm, any other key to cancel",
             theme::muted(),
         )),
+        Mode::Password(_) => Line::from(Span::styled("Enter connect · Esc cancel", theme::muted())),
+        Mode::Shares(_) => Line::from(Span::styled(SHARES_HINT, theme::fg(theme::WARNING))),
+        Mode::ShareForm(_) => Line::from(Span::styled(SHARE_FORM_HINT, theme::fg(theme::WARNING))),
         _ => normal_hint_line(app.server_started),
     };
     frame.render_widget(Paragraph::new(line), area);
@@ -870,12 +1330,20 @@ fn render_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
     } else {
         format!("{} matches", picker.entries().len())
     };
-    let title = if picker.filter().is_empty() {
-        format!("Pick a path: {} · {count}", picker.dir().display())
+    let title = if picker.is_busy() {
+        format!("Pick a path: {} · listing…", picker.origin_display())
+    } else if picker.error().is_some() {
+        format!(
+            "Pick a path: {} · {}",
+            picker.origin_display(),
+            picker.error().unwrap()
+        )
+    } else if picker.filter().is_empty() {
+        format!("Pick a path: {} · {count}", picker.origin_display())
     } else {
         format!(
             "Pick a path: {}  [filter: {}] · {count}",
-            picker.dir().display(),
+            picker.origin_display(),
             picker.filter()
         )
     };
@@ -890,6 +1358,75 @@ fn render_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
         state.select(Some(picker.cursor()));
     }
     frame.render_stateful_widget(list, area, &mut state);
+}
+
+/// The share list: one row per configured share with its details, or a hint
+/// naming the config file when nothing is configured. Renders in place of the
+/// Files table (the server is idle while it is open).
+fn render_shares(frame: &mut Frame, app: &App, list: &ShareList, area: Rect) {
+    if app.shares.is_empty() {
+        let block = theme::block_title("Shares");
+        let inner = block.inner(area);
+        let bands = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Percentage(45),
+                Constraint::Length(1),
+                Constraint::Percentage(55),
+            ])
+            .split(inner);
+        let hint = match &app.config_hint {
+            Some(path) => Paragraph::new(Span::styled(
+                format!(
+                    "No shares configured — press `a` to add one (saved to {})",
+                    path.display()
+                ),
+                theme::muted(),
+            ))
+            .alignment(Alignment::Center),
+            None => Paragraph::new(Span::styled(
+                "No shares configured — press `a` to add one (no config path known)",
+                theme::muted(),
+            ))
+            .alignment(Alignment::Center),
+        };
+        frame.render_widget(block, area);
+        frame.render_widget(hint, bands[1]);
+        return;
+    }
+
+    let rows: Vec<Row> = app
+        .shares
+        .iter()
+        .map(|share| {
+            Row::new(vec![
+                Cell::from(Span::styled(share.name.clone(), theme::text())),
+                Cell::from(Span::styled(
+                    format!("{} · {}", share.host, share.share),
+                    theme::muted(),
+                )),
+                Cell::from(Span::styled(share.username.clone(), theme::muted())),
+            ])
+        })
+        .collect();
+    let count = if app.shares.len() == 1 {
+        "1 share".to_string()
+    } else {
+        format!("{} shares", app.shares.len())
+    };
+    let widths = [
+        Constraint::Min(8),
+        Constraint::Min(12),
+        Constraint::Length(12),
+    ];
+    let table = Table::new(rows, widths)
+        .block(theme::block_title(format!("Shares · {count}")))
+        .column_spacing(2)
+        .row_highlight_style(theme::selection())
+        .highlight_symbol("> ");
+    let mut state = TableState::default();
+    state.select(Some(list.selected.min(app.shares.len() - 1)));
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 fn render_confirm(frame: &mut Frame, kind: ConfirmKind, area: Rect) {
@@ -915,6 +1452,8 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("d   remove the highlighted file"),
         Line::from("c   clear the file list (confirm)"),
         Line::from("s   start the server"),
+        Line::from("S   list configured shares"),
+        Line::from("Share list: Enter connect, a add share, Esc cancel"),
         Line::from("j/k or arrows   move the highlight"),
         Line::from("q   quit (confirm)"),
         Line::from("?   toggle this help"),
@@ -926,6 +1465,77 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
     let widget = Paragraph::new(text)
         .block(theme::block_title("Help"))
         .wrap(Wrap { trim: true });
+    frame.render_widget(widget, popup);
+}
+
+/// The password modal: a centered masked input for one share. Typed
+/// characters render solely as `*`; the length is the only visible signal.
+fn render_password(frame: &mut Frame, modal: &PasswordModal, area: Rect) {
+    let masked = "*".repeat(modal.typed_len());
+    let width = (modal.share.len() + 24 + masked.len().max(3)) as u16;
+    let popup = centered_fixed(width, 4, area);
+    frame.render_widget(Clear, popup);
+
+    let widget = Paragraph::new(Line::from(vec![
+        Span::styled(masked.clone(), theme::text()),
+        Span::styled("▏", theme::fg(theme::ACCENT)),
+    ]))
+    .block(theme::block_title(format!("Password for {}", modal.share)));
+    frame.render_widget(widget, popup);
+
+    let hint = Paragraph::new(Span::styled("Enter connect · Esc cancel", theme::muted()))
+        .alignment(Alignment::Center);
+    let hint_area = Rect {
+        x: popup.x,
+        y: popup.y + popup.height.saturating_sub(1),
+        width: popup.width,
+        height: 1,
+    };
+    frame.render_widget(hint, hint_area);
+}
+
+/// The add-share dialog: every field rendered labeled in an editable row with
+/// the focused one marked, submit errors shown inline under the fields, and no
+/// password anywhere — nothing is masked because nothing is secret.
+fn render_share_form(frame: &mut Frame, form: &ShareFormState, area: Rect) {
+    let labels = ["name", "server", "share", "username", "domain", "root"];
+    let mut rows: Vec<Line> = (0..SHARE_FORM_FIELDS)
+        .map(|field| {
+            let mut spans = vec![
+                Span::styled(
+                    format!("{:<9}", format!("{}:", labels[field])),
+                    theme::muted(),
+                ),
+                Span::styled(form.field_value(field).to_string(), theme::text()),
+            ];
+            if field == form.focus() {
+                spans.push(Span::styled("▏", theme::fg(theme::ACCENT)));
+            }
+            Line::from(spans)
+        })
+        .collect();
+
+    let errors = form.errors();
+    if !errors.is_empty() {
+        rows.push(Line::from(""));
+        rows.extend(
+            errors
+                .iter()
+                .map(|error| Line::from(Span::styled(error.clone(), theme::fg(theme::DANGER)))),
+        );
+    }
+
+    let width = rows
+        .iter()
+        .map(|row| row.width() as u16)
+        .max()
+        .unwrap_or(16)
+        + 2 // the dialog border
+        + 2;
+    let popup = centered_fixed(width.min(area.width), rows.len() as u16 + 2, area);
+    frame.render_widget(Clear, popup);
+
+    let widget = Paragraph::new(rows).block(theme::block_title("Add share"));
     frame.render_widget(widget, popup);
 }
 
@@ -1038,6 +1648,8 @@ fn abbrev_path(path: &str, max_width: usize) -> String {
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+    use dbi_backend_core::source::local::LocalStore;
+    use dbi_backend_core::source::{EntryKind, SmbLocation};
     use dbi_backend_core::transport::{Transport, TransportError};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
@@ -1844,6 +2456,7 @@ mod tests {
         let name = "game.nsp";
         let mut files = FileList::new();
         files.insert(name, &path);
+        let store = Arc::new(LocalStore::new()) as Arc<dyn Sources>;
 
         let reads = [
             range_request(name, 10, 0),  // streamed start
@@ -1867,7 +2480,7 @@ mod tests {
         let mut install_phase = false;
         let mut sending_lines = 0usize;
 
-        Server::new(MockTransport { reads: reads.into() }, files)
+        Server::new(MockTransport { reads: reads.into() }, files, store.clone())
             .run(|update| match update {
                 ServerUpdate::Log(line) => {
                     if line.starts_with("Sending: ") {
@@ -2360,6 +2973,757 @@ mod tests {
 
             let view = render(&app, 80, 24);
             assert!(view.contains(prompt));
+        }
+    }
+
+    fn share(name: &str, host: &str, share: &str, username: &str) -> ShareConfig {
+        ShareConfig {
+            name: name.to_string(),
+            host: host.to_string(),
+            port: 445,
+            share: share.to_string(),
+            username: username.to_string(),
+            domain: None,
+            root: String::new(),
+        }
+    }
+
+    /// Opens the share list with two configured shares.
+    fn app_with_shares() -> App {
+        App::with_shares(
+            FileList::new(),
+            vec![
+                share("Backup", "192.0.2.9", "backup", "player"),
+                share("Games", "192.0.2.1", "games", "player"),
+            ],
+        )
+    }
+
+    #[test]
+    fn capital_s_opens_the_share_list_and_lower_s_starts_instead() {
+        let mut app = app_with_shares();
+
+        // Lowercase `s` keeps its old meaning; with no files it changes nothing.
+        app.handle_key(press('s'));
+        assert!(matches!(app.mode, Mode::Normal));
+
+        app.handle_key(press('S'));
+        assert!(matches!(app.mode, Mode::Shares(_)));
+    }
+
+    #[test]
+    fn s_is_inert_while_the_server_is_active() {
+        let mut app = app_with_shares();
+        app.files.insert("a.nsp", "/tmp/a.nsp");
+        app.handle_key(press('s'));
+        assert_eq!(app.status, ServerStatus::Waiting);
+
+        assert_eq!(app.handle_key(press('S')), Action::None);
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn s_chip_is_locked_while_the_server_is_active() {
+        let active = {
+            let mut app = app_with_shares();
+            app.files.insert("a.nsp", "/tmp/a.nsp");
+            app.handle_key(press('s'));
+            app
+        };
+        let buf = buffer(&active, 120, 12);
+        let y = buf.area.height - 1;
+        let fgs: Vec<Color> = (0..buf.area.width)
+            .map(|x| buf.cell((x, y)).unwrap().fg)
+            .collect();
+        // The `[S]hares` chip is 8 cells in total, all dimmed while locked.
+        assert!(
+            fgs.iter().filter(|c| **c == theme::MUTED).count() >= 20,
+            "a/d/c and S are dimmed while the server is active"
+        );
+        // Idle: nothing of that chip is locked.
+        let idle = app_with_shares();
+        let buf = buffer(&idle, 120, 12);
+        let y = buf.area.height - 1;
+        let fgs: Vec<Color> = (0..buf.area.width)
+            .map(|x| buf.cell((x, y)).unwrap().fg)
+            .collect();
+        assert!(fgs.contains(&theme::ACCENT), "S stays accented when idle");
+    }
+
+    #[test]
+    fn cancelling_the_share_list_connects_to_nothing() {
+        for cancel in [KeyCode::Esc, KeyCode::Char('q')] {
+            let mut app = app_with_shares();
+            app.mode = Mode::Shares(ShareList::open());
+            app.handle_key(key(cancel));
+            assert!(matches!(app.mode, Mode::Normal));
+        }
+    }
+
+    #[test]
+    fn j_and_k_move_the_share_selection_with_clamping() {
+        let mut app = app_with_shares();
+        app.mode = Mode::Shares(ShareList::open());
+
+        app.handle_key(press('j'));
+        app.handle_key(press('j'));
+        match &app.mode {
+            Mode::Shares(list) => {
+                assert_eq!(list.selected, 1, "two downs stop at the last row")
+            }
+            _ => panic!("share list stays open"),
+        }
+        app.handle_key(key(KeyCode::Up));
+        match &app.mode {
+            Mode::Shares(list) => assert_eq!(list.selected, 0),
+            _ => panic!("share list stays open"),
+        }
+        app.handle_key(press('k'));
+        match &app.mode {
+            Mode::Shares(list) => assert_eq!(list.selected, 0, "clamped at the top"),
+            _ => panic!("share list stays open"),
+        }
+    }
+
+    #[test]
+    fn share_list_rows_show_the_details_sorted_by_name() {
+        let mut app = app_with_shares();
+        app.mode = Mode::Shares(ShareList::open());
+        let view = render(&app, 100, 14);
+
+        // alphabetical: Backup first.
+        let backup = view.find("Backup").expect("share row shown");
+        let games = view.find("Games").expect("share row shown");
+        assert!(backup < games);
+        assert!(view.contains("192.0.2.9 · backup"));
+        assert!(view.contains("192.0.2.1 · games"));
+        assert!(view.contains("player"));
+        assert!(view.contains("Shares · 2 shares"));
+    }
+
+    #[test]
+    fn empty_share_list_names_the_add_key_and_the_config_path() {
+        let mut app = App::new(FileList::new());
+        app.mode = Mode::Shares(ShareList::open());
+        let view = render(&app, 120, 14);
+        assert!(view.contains("No shares configured"));
+        assert!(view.contains("`a`"), "the add key is named: {view}");
+        assert!(
+            view.contains("config.toml"),
+            "names the config path: {view}"
+        );
+    }
+
+    #[test]
+    fn the_share_list_shows_its_own_hints_including_add() {
+        let app = app_in_share_list();
+        let view = render(&app, 100, 14);
+        assert!(view.contains("a add share"), "the add chip shows: {view}");
+        assert!(view.contains("Enter connect"));
+        assert!(view.contains("Esc cancel"));
+        assert!(
+            !view.contains("[a]dd"),
+            "the file chips do not show: {view}"
+        );
+    }
+
+    #[test]
+    fn the_help_overlay_mentions_the_share_list_keys() {
+        let mut app = App::new(FileList::new());
+        app.mode = Mode::Help;
+        let view = render(&app, 80, 24);
+        assert!(
+            view.contains("Share list: Enter connect, a add share, Esc cancel"),
+            "the share section lists its keys: {view}"
+        );
+    }
+
+    // --- 5.2: the password modal -----------------------------------------
+
+    fn app_with_password_modal(share: &str) -> App {
+        let mut app = app_with_shares();
+        app.mode = Mode::Password(PasswordModal::for_share(share));
+        app
+    }
+
+    /// The share list already open, ready for keys.
+    fn app_in_share_list() -> App {
+        let mut app = app_with_shares();
+        app.mode = Mode::Shares(ShareList::open());
+        app
+    }
+
+    #[test]
+    fn enter_opens_the_password_modal_for_the_selected_share() {
+        let mut app = app_in_share_list();
+        app.handle_key(key(KeyCode::Down)); // Games (sorted second)
+        app.handle_key(key(KeyCode::Enter));
+        match &app.mode {
+            Mode::Password(modal) => assert_eq!(modal.share, "Games"),
+            _ => panic!("expected the password modal"),
+        }
+    }
+
+    #[test]
+    fn typed_characters_mask_in_render_never_echoing_the_password() {
+        let mut app = app_with_password_modal("Games");
+        for c in "hunter2".chars() {
+            app.handle_key(press(c));
+        }
+        let view = render(&app, 80, 10);
+        assert!(view.contains("*******"), "renders one star per character");
+        assert!(!view.contains("hunter2"), "the typed text never renders");
+        assert!(view.contains("Password for Games"));
+    }
+
+    #[test]
+    fn enter_submits_and_the_buffer_leaves_with_it() {
+        let mut app = app_with_password_modal("Games");
+        for c in "secret".chars() {
+            app.handle_key(press(c));
+        }
+        let action = app.handle_key(key(KeyCode::Enter));
+        match action {
+            Action::Connect {
+                share,
+                password,
+                selection,
+            } => {
+                assert_eq!(share, "Games");
+                assert_eq!(password, "secret");
+                assert_eq!(selection, 1, "Games is the second sorted share");
+            }
+            other => panic!("expected a connect action, got {other:?}"),
+        }
+        // The modal is empty and closed; the share list is back underneath.
+        match &app.mode {
+            Mode::Shares(list) => assert_eq!(list.selected, 1),
+            _ => panic!("expected the share list after submitting"),
+        }
+    }
+
+    #[test]
+    fn enter_on_an_empty_modal_does_nothing() {
+        let mut app = app_with_password_modal("Games");
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        assert!(matches!(app.mode, Mode::Password(_)));
+    }
+
+    #[test]
+    fn backspace_reshapes_the_mask() {
+        let mut app = app_with_password_modal("Games");
+        for c in "abc".chars() {
+            app.handle_key(press(c));
+        }
+        app.handle_key(key(KeyCode::Backspace));
+        let view = render(&app, 80, 10);
+        assert!(view.contains("**"), "two stars left");
+        assert!(!view.contains("***"), "the third star is gone");
+    }
+
+    #[test]
+    fn esc_cancels_back_to_the_share_list_at_that_share() {
+        let mut app = app_in_share_list();
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter)); // modal for Games
+        app.handle_key(key(KeyCode::Esc));
+        match &app.mode {
+            Mode::Shares(list) => assert_eq!(list.selected, 1, "back at Games"),
+            _ => panic!("expected the share list after cancelling"),
+        }
+    }
+
+    #[test]
+    fn a_failed_connection_stays_on_the_share_list_for_a_retry() {
+        let mut app = app_in_share_list();
+        app.handle_key(key(KeyCode::Down));
+        app.handle_key(key(KeyCode::Enter)); // modal for Games
+        for c in "secret".chars() {
+            app.handle_key(press(c));
+        }
+        app.handle_key(key(KeyCode::Enter)); // submit (action thrown away here)
+        match &app.mode {
+            Mode::Shares(_) => {}
+            _ => panic!("expected the share list while connecting"),
+        }
+
+        // The caller logs and reports the failure; the list stays put.
+        app.push_log("Cannot connect to Games: authentication failed".to_string());
+        app.share_connection_failed("Games");
+        match &app.mode {
+            Mode::Shares(list) => assert_eq!(list.selected, 1),
+            _ => panic!("expected the share list after the failed connect"),
+        }
+    }
+
+    #[test]
+    fn a_connected_share_opens_the_picker_at_its_root() {
+        let mut app = app_with_shares();
+        app.open_share_picker("Games", "library/switch");
+
+        match &app.mode {
+            Mode::Picker(picker) => {
+                assert!(picker.is_busy(), "the root listing is pending");
+                assert_eq!(picker.origin_display(), "Games:/library/switch");
+            }
+            _ => panic!("expected the picker after a successful connect"),
+        }
+        assert_eq!(
+            app.pending_share_list(),
+            Some(Source::Smb(SmbLocation {
+                share: "Games".into(),
+                path: "library/switch".into()
+            }))
+        );
+    }
+
+    // --- 5.3: share-sourced browsing and adds -----------------------------
+
+    fn loc(path: &str) -> SmbLocation {
+        SmbLocation {
+            share: "Games".into(),
+            path: path.into(),
+        }
+    }
+
+    fn list_entry(name: &str, kind: EntryKind, size: u64) -> ListEntry {
+        ListEntry {
+            name: name.to_string(),
+            kind,
+            size,
+        }
+    }
+
+    /// A picker over a listed share root, open in the app.
+    fn app_with_share_picker() -> App {
+        let mut app = app_with_shares();
+        app.open_share_picker("Games", "");
+        if let Some(source) = app.pending_share_list() {
+            // Pretend the store answered with one directory and one file.
+            app.apply_share_listing(
+                &source,
+                vec![
+                    list_entry("Switch", EntryKind::Dir, 0),
+                    list_entry("game.nsp", EntryKind::File, 42),
+                ],
+            );
+        }
+        app
+    }
+
+    #[test]
+    fn a_share_listing_fills_the_picker() {
+        let app = app_with_share_picker();
+        match &app.mode {
+            Mode::Picker(picker) => {
+                assert!(!picker.is_busy());
+                let names: Vec<&str> = picker.entries().iter().map(|e| e.name.as_str()).collect();
+                assert_eq!(names, vec!["Switch", "game.nsp"]);
+                assert_eq!(
+                    picker.entries()[1].source,
+                    Source::Smb(loc("game.nsp")),
+                    "entries know their full share location"
+                );
+            }
+            _ => panic!("expected the picker"),
+        }
+    }
+
+    #[test]
+    fn a_failed_share_listing_shows_an_error_and_unblocks() {
+        let mut app = app_with_shares();
+        app.open_share_picker("Games", "");
+        let requested = app.pending_share_list().unwrap();
+        app.share_listing_failed(&requested, "the share is gone");
+
+        match &app.mode {
+            Mode::Picker(picker) => {
+                assert!(!picker.is_busy());
+                let view = render(&app, 100, 14);
+                assert!(view.contains("the share is gone"));
+                assert!(view.contains("Games"));
+            }
+            _ => panic!("expected the picker to stay open with the error"),
+        }
+    }
+
+    #[test]
+    fn enter_on_a_share_directory_requests_its_listing_through_the_action() {
+        let mut app = app_with_share_picker();
+        // Switch (first row) is a directory.
+        let action = app.handle_key(key(KeyCode::Enter));
+        match action {
+            Action::List(source) => assert_eq!(source, Source::Smb(loc("Switch"))),
+            other => panic!("expected a list action, got {other:?}"),
+        }
+        // The picker is busy until the listing comes back.
+        assert_eq!(app.pending_share_list(), Some(Source::Smb(loc("Switch"))),);
+        // And the listing lands.
+        app.apply_share_listing(
+            &Source::Smb(loc("Switch")),
+            vec![list_entry("game.nsp", EntryKind::File, 10)],
+        );
+        match &app.mode {
+            Mode::Picker(picker) => {
+                assert_eq!(picker.origin_display(), "Games:/Switch");
+                assert_eq!(picker.entries().len(), 1);
+                assert!(!picker.is_busy());
+            }
+            _ => panic!("expected the picker"),
+        }
+    }
+
+    #[test]
+    fn bksp_in_a_share_requests_the_parent_listing_and_stops_at_the_root() {
+        let mut app = app_with_share_picker();
+        app.handle_key(key(KeyCode::Enter)); // → Games:/Switch
+        let action = app.handle_key(key(KeyCode::Backspace)); // → root
+        match action {
+            Action::List(source) => assert_eq!(source, Source::Smb(loc(""))),
+            other => panic!("expected a list action, got {other:?}"),
+        }
+
+        // At the root, going up is a no-op.
+        app.apply_share_listing(&Source::Smb(loc("")), vec![]);
+        let action = app.handle_key(key(KeyCode::Backspace));
+        assert_eq!(action, Action::None);
+        match &app.mode {
+            Mode::Picker(picker) => assert_eq!(picker.origin_display(), "Games:/"),
+            _ => panic!("expected the picker"),
+        }
+    }
+
+    #[test]
+    fn space_on_a_share_entry_starts_an_add_and_closes_the_picker() {
+        let mut app = app_with_share_picker();
+        app.handle_key(key(KeyCode::Down)); // game.nsp
+        let action = app.handle_key(press(' '));
+        assert_eq!(action, Action::Add(Source::Smb(loc("game.nsp"))));
+        assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    #[test]
+    fn share_origins_show_in_the_files_table_share_qualified() {
+        let mut app = App::new(FileList::new());
+        app.files
+            .insert_source("game.nsp", Source::Smb(loc("switch/game.nsp")), 42);
+        let view = render(&app, 120, 12);
+        assert!(
+            view.contains("Games:/switch/game.nsp"),
+            "share-qualified origin visible"
+        );
+    }
+
+    #[test]
+    fn the_help_overlay_lists_s() {
+        let mut app = App::new(FileList::new());
+        app.mode = Mode::Help;
+        let view = render(&app, 80, 24);
+        assert!(view.contains("S   list configured shares"));
+    }
+
+    // --- the add-share form ----------------------------------------------
+
+    /// The share list open, ready to receive the form's opening key.
+    fn app_in_form_from_share_list(selected: usize) -> App {
+        let mut app = app_in_share_list();
+        if selected > 0 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        app.handle_key(press('a'));
+        app
+    }
+
+    /// The form open over the share list at Games (selected second).
+    fn app_with_form() -> App {
+        app_in_form_from_share_list(1)
+    }
+
+    #[test]
+    fn a_in_the_share_list_opens_the_add_form() {
+        let mut app = app_in_share_list();
+        assert_eq!(app.handle_key(press('a')), Action::None);
+        match &app.mode {
+            Mode::ShareForm(form) => {
+                for field in 0..SHARE_FORM_FIELDS {
+                    assert_eq!(form.field_value(field), "", "field {field} opens empty");
+                }
+                assert_eq!(form.focus(), 0, "the first field holds the focus");
+            }
+            _ => panic!("expected the add-share form"),
+        }
+    }
+
+    #[test]
+    fn a_in_the_share_list_keeps_the_entry_point_for_esc() {
+        let app = app_with_form();
+        match &app.mode {
+            Mode::ShareForm(form) => assert_eq!(form.return_selection(), 1),
+            _ => panic!("expected the form to remember the share list"),
+        }
+    }
+
+    #[test]
+    fn the_add_form_renders_as_a_dialog_with_its_hints() {
+        let mut app = app_with_form();
+        if let Mode::ShareForm(form) = &mut app.mode {
+            form.push('h');
+            form.push('o');
+            form.push('s');
+            form.push('t');
+        }
+        let view = render(&app, 80, 24);
+
+        assert!(view.contains("Add share"), "the dialog title: {view}");
+        for label in ["name", "server", "share", "username", "domain", "root"] {
+            assert!(view.contains(label), "the {label} field is shown: {view}");
+        }
+        assert!(view.contains("host"), "the typed value shows as typed");
+        assert!(view.contains("Tab next"));
+        assert!(view.contains("Esc cancel"));
+        assert!(!view.contains("[a]dd"), "the normal chips do not show");
+        assert!(
+            !view.contains("Password"),
+            "no password in the form: {view}"
+        );
+    }
+
+    #[test]
+    fn each_field_keeps_its_own_typed_text() {
+        let mut app = app_with_form();
+        for c in "nb1".chars() {
+            app.handle_key(press(c));
+        }
+        app.handle_key(key(KeyCode::Backspace));
+        app.handle_key(key(KeyCode::Tab)); // → server
+        for c in "nas.example".chars() {
+            app.handle_key(press(c));
+        }
+        app.handle_key(key(KeyCode::Down)); // → share
+        for c in "games".chars() {
+            app.handle_key(press(c));
+        }
+        app.handle_key(key(KeyCode::Up)); // back to server, values stay
+        app.handle_key(key(KeyCode::Up)); // back to name
+
+        match &app.mode {
+            Mode::ShareForm(form) => {
+                assert_eq!(form.field_value(FIELD_NAME), "nb");
+                assert_eq!(form.field_value(FIELD_SERVER), "nas.example");
+                assert_eq!(form.field_value(FIELD_SHARE), "games");
+            }
+            _ => panic!("the form stays open while typing"),
+        }
+    }
+
+    #[test]
+    fn typing_shows_in_the_render_and_never_masks() {
+        let mut app = app_with_form();
+        for c in "nas".chars() {
+            app.handle_key(press(c));
+        }
+        let view = render(&app, 80, 24);
+        assert!(view.contains("nas"), "the value shows as typed: {view}");
+        assert!(!view.contains("n**"), "no mask characters appear");
+    }
+
+    #[test]
+    fn backspace_erases_within_the_focused_field_only() {
+        let mut app = app_with_form();
+        for c in "na".chars() {
+            app.handle_key(press(c));
+        }
+        app.handle_key(key(KeyCode::Tab)); // → server
+        for c in "se".chars() {
+            app.handle_key(press(c));
+        }
+        app.handle_key(key(KeyCode::Backspace));
+
+        match &app.mode {
+            Mode::ShareForm(form) => {
+                assert_eq!(
+                    form.field_value(FIELD_SERVER),
+                    "s",
+                    "erases the focused field"
+                );
+                assert_eq!(
+                    form.field_value(FIELD_NAME),
+                    "na",
+                    "other fields keep theirs"
+                );
+            }
+            _ => panic!("the form stays open"),
+        }
+    }
+
+    #[test]
+    fn tab_and_shift_tab_move_focus_within_the_six_fields() {
+        let mut app = app_with_form();
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(form_focus(&app), 1);
+        app.handle_key(key(KeyCode::Tab));
+        app.handle_key(key(KeyCode::Tab));
+        assert_eq!(form_focus(&app), 3);
+
+        let shift_tab = KeyEvent::new(KeyCode::Tab, KeyModifiers::SHIFT);
+        app.handle_key(shift_tab);
+        assert_eq!(form_focus(&app), 2, "Shift+Tab moves back");
+    }
+
+    fn form_focus(app: &App) -> usize {
+        match &app.mode {
+            Mode::ShareForm(form) => form.focus(),
+            _ => panic!("expected the form open"),
+        }
+    }
+
+    #[test]
+    fn arrow_focus_moves_clamp_at_both_ends() {
+        let mut app = app_with_form();
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(form_focus(&app), 0, "clamped at the first field");
+        for _ in 0..8 {
+            app.handle_key(key(KeyCode::Down));
+        }
+        assert_eq!(form_focus(&app), 5, "clamped at the last field");
+        app.handle_key(key(KeyCode::Up));
+        assert_eq!(form_focus(&app), 4);
+    }
+
+    #[test]
+    fn esc_returns_to_the_share_list_without_saving() {
+        let mut app = app_with_form();
+        for c in "whatever".chars() {
+            app.handle_key(press(c));
+        }
+        assert_eq!(app.handle_key(key(KeyCode::Esc)), Action::None);
+        match &app.mode {
+            Mode::Shares(list) => assert_eq!(list.selected, 1, "back at Games"),
+            _ => panic!("expected the share list after Esc"),
+        }
+        assert_eq!(app.shares.len(), 2, "nothing was saved");
+    }
+
+    #[test]
+    fn enter_on_empty_required_fields_keeps_the_form_and_names_what_is_missing() {
+        let mut app = app_with_form();
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        match &app.mode {
+            Mode::ShareForm(form) => {
+                assert!(form.errors().contains(&"name is required".to_string()));
+                assert!(form.errors().contains(&"server is required".to_string()));
+                assert!(form.errors().contains(&"share is required".to_string()));
+                assert!(form.errors().contains(&"username is required".to_string()));
+            }
+            _ => panic!("an invalid submit keeps the form open"),
+        }
+        let view = render(&app, 80, 24);
+        assert!(
+            view.contains("name is required"),
+            "errors show inline: {view}"
+        );
+    }
+
+    #[test]
+    fn enter_with_a_bad_server_keeps_the_form_and_reports_it() {
+        let mut app = app_with_form();
+        fill_form(&mut app, ("Late", "host:bogus", "s", "u"));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        match &app.mode {
+            Mode::ShareForm(form) => {
+                assert!(form.errors().iter().any(|error| error.contains("bad port")));
+            }
+            _ => panic!("an invalid submit keeps the form open"),
+        }
+        // The typed values survive the rejected submit.
+        match &app.mode {
+            Mode::ShareForm(form) => {
+                assert_eq!(form.field_value(FIELD_NAME), "Late");
+                assert_eq!(form.field_value(FIELD_SERVER), "host:bogus");
+            }
+            _ => unreachable!(),
+        }
+    }
+
+    #[test]
+    fn enter_with_a_duplicate_name_keeps_the_form_and_reports_it_taken() {
+        let mut app = app_with_form();
+        // Games is configured by the app's own share list.
+        fill_form(&mut app, ("Games", "other.host", "other", "u"));
+        assert_eq!(app.handle_key(key(KeyCode::Enter)), Action::None);
+        match &app.mode {
+            Mode::ShareForm(form) => {
+                assert!(
+                    form.errors().iter().any(
+                        |error| error.contains("Games") && error.contains("already configured")
+                    ),
+                    "the taken name is reported: {:?}",
+                    form.errors()
+                );
+            }
+            _ => panic!("an invalid submit keeps the form open"),
+        }
+    }
+
+    #[test]
+    fn enter_with_valid_data_returns_the_add_share_action() {
+        let mut app = app_with_form();
+        fill_form(&mut app, ("Late", "nas.example", "backups", "me"));
+        match app.handle_key(key(KeyCode::Enter)) {
+            Action::AddShare { config } => {
+                assert_eq!(config.name, "Late");
+                assert_eq!(config.host, "nas.example");
+                assert_eq!(config.port, 445);
+                assert_eq!(config.share, "backups");
+                assert_eq!(config.username, "me");
+                assert_eq!(config.domain, None);
+                assert_eq!(config.root, "");
+            }
+            other => panic!("expected an add-share action, got {other:?}"),
+        }
+        // The form stays open until the caller lands back on the share list.
+        assert!(matches!(app.mode, Mode::ShareForm(_)));
+    }
+
+    #[test]
+    fn enter_with_optional_fields_carries_them() {
+        let mut app = app_with_form();
+        fill_form(&mut app, ("Late", "nas.example:9445", "backup", "me"));
+        if let Mode::ShareForm(form) = &mut app.mode {
+            form.next_field(); // username → domain
+            for c in "WORKGROUP".chars() {
+                form.push(c);
+            }
+            form.next_field(); // domain → root
+            for c in "library/switch".chars() {
+                form.push(c);
+            }
+        }
+        match app.handle_key(key(KeyCode::Enter)) {
+            Action::AddShare { config } => {
+                assert_eq!(config.port, 9445);
+                assert_eq!(config.domain.as_deref(), Some("WORKGROUP"));
+                assert_eq!(config.root, "library/switch");
+            }
+            other => panic!("expected an add-share action, got {other:?}"),
+        }
+    }
+
+    /// Types the four required values field by field: name, server, share,
+    /// username, ending after username.
+    fn fill_form(app: &mut App, values: (&str, &str, &str, &str)) {
+        for (value, is_last) in [
+            (values.0, false),
+            (values.1, false),
+            (values.2, false),
+            (values.3, true),
+        ] {
+            for c in value.chars() {
+                app.handle_key(press(c));
+            }
+            if !is_last {
+                app.handle_key(key(KeyCode::Tab));
+            }
         }
     }
 }
