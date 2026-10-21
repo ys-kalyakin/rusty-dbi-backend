@@ -17,6 +17,7 @@ thiserror.workspace = true
 nusb.workspace = true
 tokio.workspace = true
 smb2.workspace = true
+globset.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true

@@ -12,37 +12,29 @@ use clap::Parser;
 use cli::Cli;
 use crossterm::event::Event;
 use dbi_backend_core::filelist::FileList;
+use dbi_backend_core::filters::Filters;
 use dbi_backend_core::source::smb::{ShareHub, Smb2SessionFactory};
 use dbi_backend_core::source::CombinedStore;
 use dbi_backend_core::source::Source;
 use tokio::sync::mpsc;
 
 use app::{Action, App, ServerEvent};
-use config::load_user_config;
+use config::{load_user_config, FilterSettings};
 
 #[tokio::main]
 async fn main() -> Result<()> {
     let cli = Cli::parse();
 
-    let mut files = FileList::new();
-    for path in &cli.paths {
-        match files.add_path(path) {
-            Ok(outcome) => {
-                for skipped in &outcome.skipped {
-                    eprintln!("warning: skipped {skipped}: cannot be read");
-                }
-                for replaced in &outcome.replaced {
-                    eprintln!("warning: {replaced} replaced a previously added file");
-                }
-            }
-            Err(e) => eprintln!("warning: failed to add {}: {e}", path.display()),
-        }
-    }
-
     let loaded = load_user_config();
     for warning in &loaded.warnings {
         eprintln!("warning: {warning}");
     }
+    let (filters, filter_warnings) = effective_filters(&cli.filter_settings(), &loaded.filters);
+    for warning in &filter_warnings {
+        eprintln!("warning: {warning}");
+    }
+
+    let mut files = FileList::with_filters(filters);
     let shares = Arc::new(tokio::sync::Mutex::new(ShareHub::new(
         Arc::new(Smb2SessionFactory),
         loaded.shares.clone(),
@@ -50,7 +42,28 @@ async fn main() -> Result<()> {
     let store: Arc<dyn dbi_backend_core::source::Sources> =
         Arc::new(CombinedStore::new(shares.clone()));
 
+    let mut startup_adds: Vec<(String, dbi_backend_core::filelist::AddOutcome)> = Vec::new();
+    for path in &cli.paths {
+        match files.add_path(path, store.as_ref()).await {
+            Ok(outcome) => {
+                for skipped in &outcome.skipped {
+                    eprintln!("warning: skipped {skipped}: cannot be read");
+                }
+                for replaced in &outcome.replaced {
+                    eprintln!("warning: {replaced} replaced a previously added file");
+                }
+                startup_adds.push((path.display().to_string(), outcome));
+            }
+            Err(e) => eprintln!("warning: failed to add {}: {e}", path.display()),
+        }
+    }
+
     let mut app = App::with_shares(files, loaded.shares);
+    // The startup adds are reported in the log region too: the terminal
+    // warnings scroll away under the TUI's alternate screen.
+    for (display, outcome) in &startup_adds {
+        app.log_add_outcome(display, outcome);
+    }
 
     let (input_tx, mut input_rx) = mpsc::channel::<Event>(64);
     std::thread::spawn(move || input_thread(input_tx));
@@ -159,11 +172,7 @@ async fn run_action(
             list_and_apply(app, store.as_ref(), &source).await;
         }
         Action::Add(source) => {
-            let display = source.to_string();
-            match app.files.add_source(store.as_ref(), &source).await {
-                Ok(outcome) => app.log_add_outcome(&display, &outcome),
-                Err(e) => app.log_add_failure(&display, &e),
-            }
+            app.add_source(store.as_ref(), &source).await;
         }
         Action::AddShare { config } => {
             let name = config.name.clone();
@@ -201,6 +210,42 @@ async fn list_and_apply(
         Ok(entries) => app.apply_share_listing(source, entries),
         Err(e) => app.share_listing_failed(source, &e.to_string()),
     }
+}
+
+/// The filters in effect: the command line wins per setting, the config file
+/// fills what the command line leaves out, and the built-in defaults fill
+/// what is left. A pattern that does not compile is reported and skipped.
+fn effective_filters(cli: &FilterSettings, config: &FilterSettings) -> (Filters, Vec<String>) {
+    let extensions = cli
+        .extensions
+        .as_ref()
+        .filter(|list| !list.is_empty())
+        .or_else(|| config.extensions.as_ref().filter(|list| !list.is_empty()));
+    let mut filters = Filters::with_extensions(extensions.cloned().unwrap_or_default());
+
+    let include = if cli.include.is_empty() {
+        &config.include
+    } else {
+        &cli.include
+    };
+    let exclude = if cli.exclude.is_empty() {
+        &config.exclude
+    } else {
+        &cli.exclude
+    };
+
+    let mut warnings = Vec::new();
+    for pattern in include {
+        if let Err(e) = filters.add_include(pattern) {
+            warnings.push(format!("filter pattern {pattern:?}: {e}"));
+        }
+    }
+    for pattern in exclude {
+        if let Err(e) = filters.add_exclude(pattern) {
+            warnings.push(format!("filter pattern {pattern:?}: {e}"));
+        }
+    }
+    (filters, warnings)
 }
 
 #[cfg(test)]
@@ -369,7 +414,6 @@ mod tests {
     #[tokio::test]
     async fn adding_without_a_config_path_warns_and_keeps_the_share() {
         let (mut app, hub) = app_for_add(None);
-
         run_action(
             form_submission("Late", "nas.example"),
             &mut app,
@@ -394,5 +438,100 @@ mod tests {
             "the missing location warns: {:?}",
             app.log
         );
+    }
+
+    #[test]
+    fn the_command_line_wins_over_the_config_file_per_setting() {
+        let cli = FilterSettings {
+            extensions: Some(vec!["xci".into()]),
+            include: Vec::new(),
+            exclude: Vec::new(),
+        };
+        let config = FilterSettings {
+            extensions: Some(vec!["nsp".into()]),
+            include: vec!["*.nsp".into()],
+            exclude: vec!["*PATCH*".into()],
+        };
+
+        let (filters, warnings) = effective_filters(&cli, &config);
+
+        assert!(warnings.is_empty());
+        let mut extensions: Vec<&str> = filters.extensions().collect();
+        extensions.sort_unstable();
+        assert_eq!(extensions, vec!["xci"], "the command line's set wins");
+        assert_eq!(
+            filters.include_patterns(),
+            vec!["*.nsp"],
+            "the config file's patterns still apply"
+        );
+        assert_eq!(filters.exclude_patterns(), vec!["*PATCH*"]);
+    }
+
+    #[test]
+    fn the_config_file_supplies_the_settings_the_command_line_leaves_out() {
+        let config = FilterSettings {
+            extensions: Some(vec!["nsp".into()]),
+            include: vec!["*.nsp".into()],
+            exclude: Vec::new(),
+        };
+
+        let (filters, warnings) = effective_filters(&FilterSettings::default(), &config);
+
+        assert!(warnings.is_empty());
+        assert_eq!(
+            filters.extensions().collect::<Vec<_>>(),
+            vec!["nsp"],
+            "the config file's set applies"
+        );
+        assert_eq!(filters.include_patterns(), vec!["*.nsp"]);
+        assert!(filters.exclude_patterns().is_empty());
+    }
+
+    #[test]
+    fn no_settings_anywhere_mean_the_defaults() {
+        let (filters, warnings) =
+            effective_filters(&FilterSettings::default(), &FilterSettings::default());
+
+        assert!(warnings.is_empty());
+        assert_eq!(filters.extensions().collect::<Vec<_>>(), vec!["nsp", "nsz"]);
+        assert!(filters.include_patterns().is_empty());
+        assert!(filters.exclude_patterns().is_empty());
+    }
+
+    #[test]
+    fn an_invalid_pattern_is_reported_and_skipped() {
+        let cli = FilterSettings {
+            extensions: None,
+            include: Vec::new(),
+            exclude: vec!["Game[".into()],
+        };
+
+        let (filters, warnings) = effective_filters(&cli, &FilterSettings::default());
+
+        assert_eq!(warnings.len(), 1, "the bad pattern is reported");
+        assert!(
+            filters.exclude_patterns().is_empty(),
+            "the bad pattern does not apply"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_startup_paths_are_scanned_through_the_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.nsp"), b"a").unwrap();
+        std::fs::write(dir.path().join("b.nsz"), b"b").unwrap();
+
+        let mut files = FileList::with_filters(Filters::with_extensions(["nsz"]));
+        files
+            .add_path(
+                dir.path(),
+                &dbi_backend_core::source::local::LocalStore::new(),
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(files.len(), 1);
+        assert!(files.get("b.nsz").is_some());
+        assert!(files.get("a.nsp").is_none());
     }
 }

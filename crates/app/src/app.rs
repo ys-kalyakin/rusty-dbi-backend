@@ -1,7 +1,7 @@
 //! TUI application state and the background server task.
 
 use std::collections::VecDeque;
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,7 +10,8 @@ use crate::config::ShareConfig;
 use crate::picker::{Kind, Picker};
 use crate::theme;
 use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
-use dbi_backend_core::filelist::{AddOutcome, FileList};
+use dbi_backend_core::filelist::{AddOutcome, FileEntry, FileList};
+use dbi_backend_core::metadata::TitleIdentity;
 use dbi_backend_core::server::{Server, ServerUpdate};
 use dbi_backend_core::source::{ListEntry, Source, SourceError, Sources};
 use dbi_backend_core::transport::usb::UsbTransport;
@@ -265,6 +266,11 @@ pub struct App {
     pub should_quit: bool,
     pub selected: usize,
     pub progress: Option<ProgressState>,
+    /// The search narrowing the visible file list. It never changes the files
+    /// offered to the Switch.
+    pub search: String,
+    /// Whether the search input is open.
+    pub searching: bool,
     /// Configured shares for the share list, sorted by display name.
     pub shares: Vec<ShareConfig>,
     /// Where the config file lives, for the empty-share-list hint.
@@ -292,6 +298,8 @@ impl App {
             should_quit: false,
             selected: 0,
             progress: None,
+            search: String::new(),
+            searching: false,
             shares,
             config_hint: config::config_path(),
             server_started: false,
@@ -406,28 +414,28 @@ impl App {
         self.progress = Some(next);
     }
 
-    /// Add a path to the file list, logging the outcome and closing the picker.
-    fn select_path(&mut self, path: &Path) {
-        match self.files.add_path(path) {
-            Ok(outcome) => {
-                self.push_log(format!("Added: {}", path.display()));
-                for skipped in &outcome.skipped {
-                    self.push_log(format!("Warning: skipped {skipped}: cannot be read"));
-                }
-                for replaced in &outcome.replaced {
-                    self.push_log(format!(
-                        "Warning: {replaced} replaced a previously added file"
-                    ));
-                }
-            }
-            Err(e) => self.push_log(format!("Failed to add {}: {e}", path.display())),
+    /// Add a source to the file list and log the outcome.
+    ///
+    /// A local path is walked on the filesystem, a share path over the share;
+    /// both read each accepted file's identity through the store.
+    pub async fn add_source(&mut self, store: &dyn Sources, source: &Source) {
+        let display = source.to_string();
+        let outcome = match source {
+            Source::Local(path) => self
+                .files
+                .add_path(path, store)
+                .await
+                .map_err(|e| SourceError::new(e.to_string())),
+            share => self.files.add_source(store, share).await,
+        };
+        match outcome {
+            Ok(outcome) => self.log_add_outcome(&display, &outcome),
+            Err(e) => self.log_add_failure(&display, &e),
         }
-        self.mode = Mode::Normal;
-        self.clamp_selection();
     }
 
-    /// Picker keys. Local adds close the picker inline; share adds and share
-    /// listings come back as async actions for the caller to run.
+    /// Picker keys. A selection comes back as an async action for the caller
+    /// to run, so a local file is read the same way as a share file.
     fn handle_picker_key(&mut self, key: KeyEvent) -> Action {
         enum Outcome {
             None,
@@ -517,18 +525,12 @@ impl App {
         };
 
         match outcome {
-            Outcome::Select(source) => match source {
-                // Local adds complete instantly; share adds need the store.
-                Source::Local(path) => {
-                    self.select_path(&path);
-                    Action::None
-                }
-                share => {
-                    self.mode = Mode::Normal;
-                    self.clamp_selection();
-                    Action::Add(share)
-                }
-            },
+            Outcome::Select(source) => {
+                // The add needs the store, so it comes back as an action.
+                self.mode = Mode::Normal;
+                self.clamp_selection();
+                Action::Add(source)
+            }
             Outcome::List(source) => Action::List(source),
             Outcome::Cancel => {
                 self.mode = Mode::Normal;
@@ -558,7 +560,7 @@ impl App {
     }
 
     fn move_selection(&mut self, delta: isize) {
-        let len = self.files.len();
+        let len = self.visible_files().len();
         if len == 0 {
             self.selected = 0;
             return;
@@ -573,7 +575,7 @@ impl App {
     }
 
     fn clamp_selection(&mut self) {
-        let len = self.files.len();
+        let len = self.visible_files().len();
         self.selected = if len == 0 {
             0
         } else {
@@ -582,13 +584,65 @@ impl App {
     }
 
     fn remove_selected(&mut self) {
-        let name = self.files.names().nth(self.selected).cloned();
+        let name = {
+            let visible = self.visible_files();
+            visible.get(self.selected).map(|(name, _)| (*name).clone())
+        };
         if let Some(name) = name {
             if self.files.remove(&name).is_some() {
                 self.push_log(format!("Removed: {name}"));
                 self.clamp_selection();
             }
         }
+    }
+
+    /// The files the list region shows: the offered files whose name matches
+    /// the active search, ignoring case. The search never changes the files
+    /// offered to the Switch — that is the whole list.
+    pub fn visible_files(&self) -> Vec<(&String, &FileEntry)> {
+        let needle = self.search.to_lowercase();
+        self.files
+            .iter()
+            .filter(|(name, _)| needle.is_empty() || name.to_lowercase().contains(&needle))
+            .collect()
+    }
+
+    /// Whether the search input is open.
+    pub fn is_searching(&self) -> bool {
+        self.searching
+    }
+
+    /// The active search string.
+    pub fn search(&self) -> &str {
+        &self.search
+    }
+
+    /// Open the search input, keeping the search it holds.
+    pub fn start_search(&mut self) {
+        self.searching = true;
+    }
+
+    /// Close the search input, keeping the search.
+    pub fn stop_search(&mut self) {
+        self.searching = false;
+    }
+
+    /// Type into the search.
+    pub fn push_search(&mut self, c: char) {
+        self.search.push(c);
+        self.clamp_selection();
+    }
+
+    /// Erase the search's last character.
+    pub fn pop_search(&mut self) {
+        self.search.pop();
+        self.clamp_selection();
+    }
+
+    /// Clear the search, so every file is visible again.
+    pub fn clear_search(&mut self) {
+        self.search.clear();
+        self.clamp_selection();
     }
 
     pub fn handle_key(&mut self, key: KeyEvent) -> Action {
@@ -624,6 +678,12 @@ impl App {
                 return Action::None;
             }
             Mode::Normal => {}
+        }
+
+        // The open search input takes the keys while it is open, in every
+        // view it can be opened from.
+        if self.is_searching() {
+            return self.handle_search_key(key);
         }
 
         // While the server task is active (waiting or running), edits are inert so
@@ -681,6 +741,51 @@ impl App {
                 if !running {
                     self.mode = Mode::Shares(ShareList::open());
                 }
+                Action::None
+            }
+            KeyCode::Char('/') => {
+                self.start_search();
+                Action::None
+            }
+            KeyCode::Esc => {
+                if !self.search.is_empty() {
+                    self.clear_search();
+                }
+                Action::None
+            }
+            _ => Action::None,
+        }
+    }
+
+    /// Keys of the open search input: type to narrow the list, Backspace to
+    /// erase, Enter to keep the search and close the input, Esc to clear the
+    /// search, and the arrows to move the highlight. The search is a
+    /// read-only view: it works while the server runs.
+    fn handle_search_key(&mut self, key: KeyEvent) -> Action {
+        match key.code {
+            KeyCode::Char(c) => {
+                self.push_search(c);
+                Action::None
+            }
+            KeyCode::Backspace => {
+                self.pop_search();
+                Action::None
+            }
+            KeyCode::Enter => {
+                self.stop_search();
+                Action::None
+            }
+            KeyCode::Esc => {
+                self.clear_search();
+                self.stop_search();
+                Action::None
+            }
+            KeyCode::Up => {
+                self.move_selection(-1);
+                Action::None
+            }
+            KeyCode::Down => {
+                self.move_selection(1);
                 Action::None
             }
             _ => Action::None,
@@ -896,7 +1001,15 @@ impl App {
 
     /// Log the outcome of an add, whether sync (local) or awaited (share).
     pub fn log_add_outcome(&mut self, display: &str, outcome: &AddOutcome) {
-        self.push_log(format!("Added: {display}"));
+        let rejected = if outcome.rejected > 0 {
+            format!(", {} rejected by the filters", outcome.rejected)
+        } else {
+            String::new()
+        };
+        self.push_log(format!(
+            "Added: {display} ({} files{rejected})",
+            outcome.added.len()
+        ));
         for skipped in &outcome.skipped {
             self.push_log(format!("Warning: skipped {skipped}: cannot be read"));
         }
@@ -1018,17 +1131,21 @@ const PICKER_HINT: &str = "Esc cancel  Enter open  Space add  Bksp up  / filter"
 /// Hint line shown while the share list is open.
 const SHARES_HINT: &str = "Esc cancel  Enter connect  a add share";
 
+/// Hint line shown while the search input is open.
+const SEARCH_HINT: &str = "Esc clear  Enter keep  Bksp erase";
+
 /// Hint line shown while the add-share form is open.
 const SHARE_FORM_HINT: &str = "Tab next  Enter save  Esc cancel";
 
 /// The normal-view hint broken into keyed chip pairs: bracketed key text, label
 /// remainder, and the key character (for locked-out detection).
-const NORMAL_ACTIONS: [(&str, &str, char); 7] = [
+const NORMAL_ACTIONS: [(&str, &str, char); 8] = [
     ("[a]", "dd", 'a'),
     ("[d]", "elete", 'd'),
     ("[c]", "lear", 'c'),
     ("[s]", "tart", 's'),
     ("[S]", "hares", 'S'),
+    ("[/]", "search", '/'),
     ("[q]", "uit", 'q'),
     ("[?]", " help", '?'),
 ];
@@ -1145,33 +1262,48 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
 }
 
 fn render_files(frame: &mut Frame, app: &App, area: Rect) {
-    if app.files.is_empty() {
-        render_empty_files_hint(frame, area);
+    let visible = app.visible_files();
+    if visible.is_empty() {
+        if app.files.is_empty() {
+            render_empty_files_hint(frame, area);
+        } else {
+            render_no_match_hint(frame, area);
+        }
         return;
     }
-    let widths = [
-        Constraint::Min(4),
-        Constraint::Length(10),
-        Constraint::Min(8),
-    ];
-    let rows: Vec<Row> = app
-        .files
+    // The identity needs room of its own; below that width it is dropped
+    // rather than squeezing the name out of the list.
+    let show_identity = area.width >= IDENTITY_MIN_WIDTH;
+    let mut widths = vec![Constraint::Min(4), Constraint::Length(10)];
+    if show_identity {
+        widths.push(Constraint::Length(IDENTITY_WIDTH));
+    }
+    widths.push(Constraint::Min(8));
+    let widths: &[Constraint] = &widths;
+    let rows: Vec<Row> = visible
         .iter()
         .map(|(name, entry)| {
-            Row::new(vec![
-                Cell::from(Span::styled(name.clone(), theme::text())),
+            let mut cells = vec![
+                Cell::from(Span::styled((*name).clone(), theme::text())),
                 Cell::from(
                     Line::styled(human_size(entry.size), theme::muted())
                         .alignment(Alignment::Right),
                 ),
-                Cell::from(Span::styled(
-                    abbrev_path(
-                        &entry.source.to_string(),
-                        (area.width as usize).saturating_sub(20),
-                    ),
+            ];
+            if show_identity {
+                cells.push(Cell::from(Span::styled(
+                    identity_text(&entry.identity),
                     theme::muted(),
-                )),
-            ])
+                )));
+            }
+            cells.push(Cell::from(Span::styled(
+                abbrev_path(
+                    &entry.source.to_string(),
+                    (area.width as usize).saturating_sub(20),
+                ),
+                theme::muted(),
+            )));
+            Row::new(cells)
         })
         .collect();
     let files = Table::new(rows, widths)
@@ -1180,10 +1312,28 @@ fn render_files(frame: &mut Frame, app: &App, area: Rect) {
         .row_highlight_style(theme::selection())
         .highlight_symbol("> ");
     let mut state = TableState::default();
-    if !app.files.is_empty() {
-        state.select(Some(app.selected.min(app.files.len() - 1)));
+    if !visible.is_empty() {
+        state.select(Some(app.selected.min(visible.len() - 1)));
     }
     frame.render_stateful_widget(files, area, &mut state);
+}
+
+/// A centered hint shown when the search matches none of the offered files.
+fn render_no_match_hint(frame: &mut Frame, area: Rect) {
+    let block = theme::block_title("Files");
+    let inner = block.inner(area);
+    let bands = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(45),
+            Constraint::Length(1),
+            Constraint::Percentage(55),
+        ])
+        .split(inner);
+    let hint = Paragraph::new(Span::styled("No file matches the search", theme::muted()))
+        .alignment(Alignment::Center);
+    frame.render_widget(block, area);
+    frame.render_widget(hint, bands[1]);
 }
 
 /// A centered onboarding hint shown when no files are offered (picker closed).
@@ -1205,6 +1355,29 @@ fn render_empty_files_hint(frame: &mut Frame, area: Rect) {
     .alignment(Alignment::Center);
     frame.render_widget(block, area);
     frame.render_widget(hint, bands[1]);
+}
+
+/// The width the identity column takes: the title id, the kind of content and
+/// the version, separated by spaces.
+const IDENTITY_WIDTH: u16 = 28;
+
+/// The narrowest terminal that still shows the identity column.
+const IDENTITY_MIN_WIDTH: u16 = 64;
+
+/// The identity as the list shows it: the title id, the kind of content and
+/// the version. A file without an identity shows nothing.
+fn identity_text(identity: &TitleIdentity) -> String {
+    let mut parts: Vec<String> = Vec::new();
+    if let Some(title_id) = &identity.title_id {
+        parts.push(title_id.clone());
+    }
+    if let Some(content_type) = identity.content_type {
+        parts.push(content_type.label().to_string());
+    }
+    if let Some((major, minor, patch)) = identity.version {
+        parts.push(format!("{major}.{minor}.{patch}"));
+    }
+    parts.join(" ")
 }
 
 fn render_progress(frame: &mut Frame, app: &App, area: Rect) {
@@ -1295,6 +1468,11 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Password(_) => Line::from(Span::styled("Enter connect · Esc cancel", theme::muted())),
         Mode::Shares(_) => Line::from(Span::styled(SHARES_HINT, theme::fg(theme::WARNING))),
         Mode::ShareForm(_) => Line::from(Span::styled(SHARE_FORM_HINT, theme::fg(theme::WARNING))),
+        Mode::Normal if app.searching => Line::from(vec![
+            Span::styled(format!("search: {}", app.search()), theme::accent()),
+            Span::raw("  "),
+            Span::styled(SEARCH_HINT, theme::muted()),
+        ]),
         _ => normal_hint_line(app.server_started),
     };
     frame.render_widget(Paragraph::new(line), area);
@@ -1455,6 +1633,7 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("S   list configured shares"),
         Line::from("Share list: Enter connect, a add share, Esc cancel"),
         Line::from("j/k or arrows   move the highlight"),
+        Line::from("/   search the file list"),
         Line::from("q   quit (confirm)"),
         Line::from("?   toggle this help"),
         Line::from(""),
@@ -1648,12 +1827,18 @@ fn abbrev_path(path: &str, max_width: usize) -> String {
 mod tests {
     use super::*;
     use crossterm::event::KeyModifiers;
+    use dbi_backend_core::filters::Filters;
+    use dbi_backend_core::metadata::ContentType;
+    use dbi_backend_core::protocol::{
+        Header, CMD_ID_EXIT, CMD_ID_LIST, CMD_TYPE_ACK, CMD_TYPE_REQUEST,
+    };
     use dbi_backend_core::source::local::LocalStore;
     use dbi_backend_core::source::{EntryKind, SmbLocation};
     use dbi_backend_core::transport::{Transport, TransportError};
     use ratatui::backend::TestBackend;
     use ratatui::Terminal;
     use std::fs;
+    use std::path::Path;
 
     fn press(c: char) -> KeyEvent {
         KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
@@ -1742,6 +1927,270 @@ mod tests {
         app.handle_key(press('x'));
         assert_eq!(app.files.len(), 1);
         assert!(matches!(app.mode, Mode::Normal));
+    }
+
+    /// An app offering the given file names, all with a size.
+    fn app_with_files(names: &[&str]) -> App {
+        let mut app = App::new(FileList::new());
+        for name in names {
+            app.files.insert(*name, format!("/tmp/{name}"));
+        }
+        app
+    }
+
+    /// Type the given text into the file list's search.
+    fn type_search(app: &mut App, text: &str) {
+        app.handle_key(press('/'));
+        for c in text.chars() {
+            app.handle_key(press(c));
+        }
+    }
+
+    /// Run the add an action asks for, the way the caller does.
+    async fn run_add(app: &mut App, action: Action) {
+        let Action::Add(source) = action else {
+            panic!("the action adds a source: {action:?}");
+        };
+        app.add_source(&LocalStore::new(), &source).await;
+    }
+
+    /// The names the file list region shows.
+    fn visible_names(app: &App) -> Vec<String> {
+        app.visible_files()
+            .iter()
+            .map(|(name, _)| (*name).clone())
+            .collect()
+    }
+
+    #[test]
+    fn a_search_narrows_the_visible_list() {
+        let mut app = app_with_files(&["game.nsp", "other.nsz"]);
+        type_search(&mut app, "GAME");
+        assert_eq!(visible_names(&app), vec!["game.nsp"]);
+    }
+
+    #[test]
+    fn a_search_with_no_matches_shows_an_empty_list() {
+        let mut app = app_with_files(&["game.nsp"]);
+        type_search(&mut app, "zzz");
+        assert!(visible_names(&app).is_empty());
+    }
+
+    #[test]
+    fn clearing_the_search_restores_the_full_list() {
+        let mut app = app_with_files(&["game.nsp", "other.nsz"]);
+        type_search(&mut app, "game");
+        assert_eq!(visible_names(&app).len(), 1);
+        app.handle_key(key(KeyCode::Esc));
+        assert_eq!(visible_names(&app).len(), 2);
+    }
+
+    #[test]
+    fn the_search_does_not_change_what_the_switch_receives() {
+        let mut app = app_with_files(&["game.nsp", "other.nsz"]);
+        type_search(&mut app, "game");
+        assert_eq!(visible_names(&app).len(), 1);
+        assert_eq!(
+            app.files.len(),
+            2,
+            "the offered list keeps every file the scan accepted"
+        );
+    }
+
+    #[test]
+    fn d_removes_the_visible_file() {
+        let mut app = app_with_files(&["a.nsp", "b.nsp"]);
+        type_search(&mut app, "b");
+        // Enter keeps the search and closes the input; only then do the
+        // editing keys act again.
+        app.handle_key(key(KeyCode::Enter));
+        app.handle_key(press('d'));
+        assert!(app.files.get("b.nsp").is_none(), "the visible file goes");
+        assert!(
+            app.files.get("a.nsp").is_some(),
+            "the hidden file stays offered"
+        );
+    }
+
+    #[test]
+    fn the_open_search_input_takes_the_keys() {
+        let mut app = app_with_files(&["a.nsp"]);
+        type_search(&mut app, "d");
+        assert_eq!(app.search(), "d", "the key went into the search");
+        assert!(
+            app.files.get("a.nsp").is_some(),
+            "typing does not remove a file"
+        );
+    }
+
+    #[test]
+    fn the_highlight_stays_within_the_visible_list() {
+        let mut app = app_with_files(&["a.nsp", "b.nsp"]);
+        type_search(&mut app, "b");
+        app.handle_key(press('j'));
+        app.handle_key(press('k'));
+        assert_eq!(app.selected, 0, "the highlight stays on the only match");
+    }
+
+    #[test]
+    fn the_search_works_while_the_server_runs() {
+        let mut app = app_with_files(&["game.nsp"]);
+        assert_eq!(app.handle_key(press('s')), Action::Start);
+        app.handle_key(press('/'));
+        assert!(app.is_searching(), "the search is a read-only view");
+        app.handle_key(press('a'));
+        assert!(
+            matches!(app.mode, Mode::Normal),
+            "the editing keys stay locked while the server runs"
+        );
+    }
+
+    #[test]
+    fn the_add_log_line_names_the_accepted_and_rejected_counts() {
+        let mut app = App::new(FileList::new());
+        let outcome = AddOutcome {
+            added: vec!["a.nsp".into(), "b.nsp".into()],
+            rejected: 5,
+            ..AddOutcome::default()
+        };
+
+        app.log_add_outcome("/games", &outcome);
+
+        let line = app.log.back().unwrap().message.clone();
+        assert!(
+            line.contains("2 files"),
+            "the accepted count is named: {line}"
+        );
+        assert!(
+            line.contains("5 rejected"),
+            "the rejected count is named: {line}"
+        );
+    }
+
+    #[test]
+    fn a_scan_that_rejects_everything_says_so() {
+        let mut app = App::new(FileList::new());
+        let outcome = AddOutcome {
+            rejected: 3,
+            ..AddOutcome::default()
+        };
+
+        app.log_add_outcome("/games", &outcome);
+
+        let line = app.log.back().unwrap().message.clone();
+        assert!(line.contains("0 files"), "no file was accepted: {line}");
+        assert!(
+            line.contains("3 rejected"),
+            "the rejected count is named: {line}"
+        );
+    }
+
+    #[test]
+    fn the_picker_takes_the_search_key() {
+        let dir = tempfile::tempdir().unwrap();
+        let mut app = app_with_picker(dir.path());
+        app.handle_key(press('/'));
+        assert!(!app.is_searching(), "the picker handles the key");
+    }
+
+    #[test]
+    fn the_file_list_renders_the_matching_rows() {
+        let mut app = app_with_files(&["game.nsp", "other.nsz"]);
+        type_search(&mut app, "game");
+        let text = render(&app, 80, 20);
+        assert!(text.contains("game.nsp"), "the match is shown: {text}");
+        assert!(
+            !text.contains("other.nsz"),
+            "the hidden file is not shown: {text}"
+        );
+    }
+
+    #[test]
+    fn the_hint_line_names_the_search_key() {
+        let app = app_with_files(&["game.nsp"]);
+        let text = render(&app, 100, 20);
+        assert!(text.contains("search"), "the hint names the key: {text}");
+    }
+
+    #[test]
+    fn a_scan_without_a_match_says_so() {
+        let mut app = app_with_files(&["game.nsp"]);
+        type_search(&mut app, "zzz");
+        let text = render(&app, 80, 20);
+        assert!(
+            text.contains("No file matches"),
+            "the region explains itself: {text}"
+        );
+        assert!(!text.contains("game.nsp"), "no file is shown: {text}");
+    }
+
+    /// A transport that hands out the given reads and records the writes.
+    struct RecordingTransport {
+        reads: std::collections::VecDeque<Vec<u8>>,
+        writes: Vec<Vec<u8>>,
+    }
+
+    #[async_trait::async_trait]
+    impl Transport for RecordingTransport {
+        async fn read(&mut self, _len: usize) -> Result<Vec<u8>, TransportError> {
+            self.reads
+                .pop_front()
+                .ok_or_else(|| TransportError::Usb("no more reads".into()))
+        }
+
+        async fn write(&mut self, data: &[u8]) -> Result<(), TransportError> {
+            self.writes.push(data.to_vec());
+            Ok(())
+        }
+    }
+
+    #[tokio::test]
+    async fn the_switch_receives_the_whole_offered_list_while_a_search_narrows_the_view() {
+        let dir = tempfile::tempdir().unwrap();
+        for name in ["a.nsp", "b.nsp", "notes.txt", "cover.jpg"] {
+            fs::write(dir.path().join(name), name).unwrap();
+        }
+
+        let mut files = FileList::with_filters(Filters::with_extensions(["nsp"]));
+        let outcome = files
+            .add_path(dir.path(), &LocalStore::new())
+            .await
+            .unwrap();
+        assert_eq!(outcome.added.len(), 2, "the scan accepted two files");
+        assert_eq!(outcome.rejected, 2, "the filters rejected two files");
+
+        let mut app = App::new(files);
+        type_search(&mut app, "a");
+        assert_eq!(visible_names(&app), vec!["a.nsp"], "the view is narrowed");
+        assert_eq!(
+            app.files.len(),
+            2,
+            "the offered list keeps every file the scan accepted"
+        );
+
+        // The server answers a LIST with every offered name, not only the
+        // matching one.
+        let reads = vec![
+            Header::new(CMD_TYPE_REQUEST, CMD_ID_LIST, 0)
+                .to_bytes()
+                .to_vec(),
+            Header::new(CMD_TYPE_ACK, 0, 0).to_bytes().to_vec(),
+            Header::new(CMD_TYPE_REQUEST, CMD_ID_EXIT, 0)
+                .to_bytes()
+                .to_vec(),
+        ];
+        let mut server = Server::new(
+            RecordingTransport {
+                reads: reads.into(),
+                writes: Vec::new(),
+            },
+            app.files.clone(),
+            Arc::new(LocalStore::new()),
+        );
+        server.run(|_update| {}).await.unwrap();
+        let transport = server.into_transport();
+
+        assert_eq!(transport.writes[1], b"a.nsp\nb.nsp\n");
     }
 
     #[test]
@@ -1934,50 +2383,54 @@ mod tests {
         assert!(!app.should_quit);
     }
 
-    #[test]
-    fn selecting_a_file_adds_it_directly() {
+    #[tokio::test]
+    async fn selecting_a_file_adds_it_directly() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("game.nsp"), b"g").unwrap();
 
         let mut app = app_with_picker(dir.path());
-        app.handle_key(key(KeyCode::Char(' ')));
+        let action = app.handle_key(key(KeyCode::Char(' ')));
         assert!(matches!(app.mode, Mode::Normal));
+        run_add(&mut app, action).await;
         assert!(app.files.get("game.nsp").is_some());
     }
 
-    #[test]
-    fn selecting_an_existing_name_logs_a_replacement_warning() {
+    #[tokio::test]
+    async fn selecting_an_existing_name_logs_a_replacement_warning() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("game.nsp"), b"g").unwrap();
 
         let mut app = app_with_picker(dir.path());
         app.files.insert("game.nsp", "/elsewhere/game.nsp");
-        app.handle_key(key(KeyCode::Char(' ')));
+        let action = app.handle_key(key(KeyCode::Char(' ')));
+        run_add(&mut app, action).await;
 
         assert!(app.log.iter().any(|l| l.message.contains("replaced")));
     }
 
-    #[test]
-    fn enter_on_a_file_adds_it() {
+    #[tokio::test]
+    async fn enter_on_a_file_adds_it() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("game.nsp"), b"g").unwrap();
 
         let mut app = app_with_picker(dir.path());
-        app.handle_key(key(KeyCode::Enter));
+        let action = app.handle_key(key(KeyCode::Enter));
         assert!(matches!(app.mode, Mode::Normal));
+        run_add(&mut app, action).await;
         assert!(app.files.get("game.nsp").is_some());
     }
 
-    #[test]
-    fn selecting_a_directory_adds_its_contents_recursively() {
+    #[tokio::test]
+    async fn selecting_a_directory_adds_its_contents_recursively() {
         let dir = tempfile::tempdir().unwrap();
         let sub = dir.path().join("titles");
         fs::create_dir(&sub).unwrap();
         fs::write(sub.join("a.nsp"), b"a").unwrap();
 
         let mut app = app_with_picker(dir.path());
-        app.handle_key(key(KeyCode::Char(' ')));
+        let action = app.handle_key(key(KeyCode::Char(' ')));
         assert!(matches!(app.mode, Mode::Normal));
+        run_add(&mut app, action).await;
         assert!(app.files.get("a.nsp").is_some());
     }
 
@@ -2065,12 +2518,115 @@ mod tests {
         assert_eq!(app.files.len(), 1);
     }
 
+    #[tokio::test]
+    async fn the_flow_reads_the_identities_and_keeps_the_offer_unchanged() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Game [0100000000010000][v65536].nsp"), b"a").unwrap();
+        fs::write(dir.path().join("Update [0100000000010800].nsp"), b"b").unwrap();
+        fs::write(dir.path().join("notes.txt"), b"c").unwrap();
+
+        let mut files = FileList::new();
+        let outcome = files
+            .add_path(dir.path(), &LocalStore::new())
+            .await
+            .unwrap();
+        assert_eq!(outcome.added.len(), 2, "two titles were accepted");
+        assert_eq!(outcome.rejected, 1, "the notes file was rejected");
+
+        let app = App::new(files);
+        let base = app
+            .files
+            .get("Game [0100000000010000][v65536].nsp")
+            .unwrap();
+        assert_eq!(base.identity.title_id.as_deref(), Some("0100000000010000"));
+        assert_eq!(base.identity.content_type, Some(ContentType::Base));
+        assert_eq!(base.identity.version, Some((1, 0, 0)));
+        let update = app.files.get("Update [0100000000010800].nsp").unwrap();
+        assert_eq!(
+            update.identity.title_id.as_deref(),
+            Some("0100000000010800")
+        );
+        assert_eq!(update.identity.content_type, Some(ContentType::Update));
+
+        // The offer to the Switch is unchanged: the same names, in the same
+        // order, whatever the identities say.
+        let reads = vec![
+            Header::new(CMD_TYPE_REQUEST, CMD_ID_LIST, 0)
+                .to_bytes()
+                .to_vec(),
+            Header::new(CMD_TYPE_ACK, 0, 0).to_bytes().to_vec(),
+            Header::new(CMD_TYPE_REQUEST, CMD_ID_EXIT, 0)
+                .to_bytes()
+                .to_vec(),
+        ];
+        let mut server = Server::new(
+            RecordingTransport {
+                reads: reads.into(),
+                writes: Vec::new(),
+            },
+            app.files.clone(),
+            Arc::new(LocalStore::new()),
+        );
+        server.run(|_update| {}).await.unwrap();
+        let transport = server.into_transport();
+
+        assert_eq!(
+            transport.writes[1],
+            b"Game [0100000000010000][v65536].nsp\nUpdate [0100000000010800].nsp\n"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_file_list_shows_the_title_identity() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Game [0100000000010000][v65536].nsp"), b"x").unwrap();
+        let mut app = App::new(FileList::new());
+        app.files
+            .add_path(dir.path(), &LocalStore::new())
+            .await
+            .unwrap();
+
+        let view = render(&app, 120, 12);
+        assert!(view.contains("0100000000010000"), "the id is shown: {view}");
+        assert!(view.contains("base"), "the kind is shown: {view}");
+        assert!(view.contains("1.0.0"), "the version is shown: {view}");
+    }
+
     #[test]
-    fn files_list_shows_sizes_and_total() {
+    fn a_file_without_an_identity_shows_only_its_name() {
+        let mut app = App::new(FileList::new());
+        app.files.insert("plain.nsp", "/tmp/plain.nsp");
+
+        let view = render(&app, 120, 12);
+        assert!(view.contains("plain.nsp"), "the name is shown: {view}");
+        assert!(!view.contains("base"), "no kind is shown: {view}");
+        assert!(!view.contains("1.0.0"), "no version is shown: {view}");
+    }
+
+    #[tokio::test]
+    async fn a_narrow_terminal_drops_the_identity_but_keeps_the_name() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Game [0100000000010000][v65536].nsp"), b"x").unwrap();
+        let mut app = App::new(FileList::new());
+        app.files
+            .add_path(dir.path(), &LocalStore::new())
+            .await
+            .unwrap();
+
+        let view = render(&app, 40, 12);
+        assert!(view.contains("Game"), "the name stays: {view}");
+        assert!(!view.contains("1.0.0"), "the identity is dropped: {view}");
+    }
+
+    #[tokio::test]
+    async fn files_list_shows_sizes_and_total() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.nsp"), vec![0u8; 2048]).unwrap();
         let mut app = App::new(FileList::new());
-        app.files.add_path(dir.path()).unwrap();
+        app.files
+            .add_path(dir.path(), &LocalStore::new())
+            .await
+            .unwrap();
 
         let view = render(&app, 80, 12);
         assert!(view.contains("2.0 KiB"));
@@ -2091,13 +2647,16 @@ mod tests {
         assert!(!view.contains("No files yet"));
     }
 
-    #[test]
-    fn size_column_is_right_aligned_in_the_files_table() {
+    #[tokio::test]
+    async fn size_column_is_right_aligned_in_the_files_table() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.nsp"), vec![0u8; 1024]).unwrap();
         fs::write(dir.path().join("verylonggamename.nsp"), vec![0u8; 2048]).unwrap();
         let mut app = App::new(FileList::new());
-        app.files.add_path(dir.path()).unwrap();
+        app.files
+            .add_path(dir.path(), &LocalStore::new())
+            .await
+            .unwrap();
 
         let buf = buffer(&app, 80, 12);
         // Files rows start below the header (y=0) and the top border (y=1); the last
@@ -2849,13 +3408,16 @@ mod tests {
         assert_eq!(abbrev_path("/very/long/path", 1), "…");
     }
 
-    #[test]
-    fn narrow_terminal_truncates_long_paths() {
+    #[tokio::test]
+    async fn narrow_terminal_truncates_long_paths() {
         let dir = tempfile::tempdir().unwrap();
         let long_name = "a-nsp-file-with-a-remarkably-long-name.nsp";
         fs::write(dir.path().join(long_name), vec![0u8; 2048]).unwrap();
         let mut app = App::new(FileList::new());
-        app.files.add_path(dir.path()).unwrap();
+        app.files
+            .add_path(dir.path(), &LocalStore::new())
+            .await
+            .unwrap();
 
         let view = render(&app, 40, 12);
         assert!(view.contains('…'));
