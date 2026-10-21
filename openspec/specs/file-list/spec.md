@@ -23,11 +23,12 @@ directory and from every nested subdirectory, at any depth.
 - **WHEN** a directory with no matching files at any depth is added
 - **THEN** the add succeeds and the file list is unchanged
 
-### Requirement: Directory scans include only NSP and NSZ files
+### Requirement: Directory scans include only filtered files
 
-When scanning a directory, the system SHALL add only regular files whose
-extension is `.nsp` or `.nsz`, matching the extension case-insensitively, and
-SHALL ignore every other file and directory entry.
+When scanning a directory, the system SHALL add only regular files that the
+configured filters accept, and SHALL ignore every other file and directory
+entry. The filters' rules — the accepted extension set and the include and
+exclude patterns — are defined by the `filters` capability.
 
 #### Scenario: Non-matching files are skipped
 
@@ -39,15 +40,26 @@ SHALL ignore every other file and directory entry.
 - **WHEN** a directory containing `GAME.NSP` and `Patch.NsZ` is added
 - **THEN** both files are present in the file list
 
-### Requirement: Adding a single file ignores extension filtering
+#### Scenario: A file the filters reject is skipped
+
+- **WHEN** a directory contains a file that the configured filters do not accept
+- **THEN** that file is not present in the file list
+
+### Requirement: A directly added file is added unfiltered
 
 When a path that is a regular file is added directly, the system SHALL add that
-file regardless of its extension.
+file regardless of its extension and regardless of the configured include and
+exclude patterns, because the user named that file explicitly.
 
 #### Scenario: Explicit file with another extension is added
 
 - **WHEN** a regular file named `readme.txt` is added directly
 - **THEN** `readme.txt` is present in the file list
+
+#### Scenario: An explicitly named file ignores the patterns
+
+- **WHEN** an exclude pattern matches the name of a regular file that is added directly
+- **THEN** that file is present in the file list
 
 ### Requirement: Entries are keyed by file name
 
@@ -105,9 +117,9 @@ from either kind.
 ### Requirement: Adding a share directory scans it over the share
 
 When a directory on a connected share is added, the system SHALL scan it
-recursively over the share's listings, SHALL add only `.nsp` and `.nsz` files
-matching the extension case-insensitively, and SHALL continue past entries or
-subdirectories that cannot be listed, reporting each skipped path.
+recursively over the share's listings, SHALL add only the files the configured
+filters accept, and SHALL continue past entries or subdirectories that cannot
+be listed, reporting each skipped path.
 
 #### Scenario: A share directory's matching files are added with their sizes
 
@@ -118,6 +130,11 @@ subdirectories that cannot be listed, reporting each skipped path.
 
 - **WHEN** a scanned share directory contains a subdirectory whose listing fails and a readable `a.nsp`
 - **THEN** `a.nsp` is added, the failed subdirectory is reported, and the scan continues
+
+#### Scenario: The same filters apply over a share
+
+- **WHEN** a share directory contains a file the configured filters do not accept
+- **THEN** that file is not added to the file list
 
 ### Requirement: A directly added share file ignores extension filtering
 
@@ -145,3 +162,25 @@ in the requirement "Directory scans tolerate unreadable entries".
 
 - **WHEN** a directory is added whose listing contains only `.` and `..`
 - **THEN** the add terminates quickly and the file list is unchanged
+
+### Requirement: Entries carry the title identity
+
+When a file is added, the system SHALL record the identity of its container —
+the title id, the content type and the version — whenever one could be
+determined, and SHALL make that identity available alongside the entry's name
+and size. Reading the identity SHALL NOT keep the file from being added.
+
+#### Scenario: The identity is recorded on add
+
+- **WHEN** a file whose title id can be determined is added
+- **THEN** the entry reports that title id, the content type and the version
+
+#### Scenario: The identity is available for every entry
+
+- **WHEN** the file list is read
+- **THEN** each entry exposes an identity, empty for a file whose identity could not be determined
+
+#### Scenario: A file that cannot be read for its identity is still added
+
+- **WHEN** a file is added whose container cannot be read
+- **THEN** the entry is present in the file list and carries no identity
