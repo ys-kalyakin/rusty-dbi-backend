@@ -14,9 +14,9 @@
 
 ## 3. Core: one reconnect path in the share hub
 
-- [ ] 3.1 Replace the three copies of the ensure-live / try / rebuild-once sequence in `crates/core/src/source/smb.rs` (`list_dir` at `:179-195`, `open` at `:200-216`, `stat` at `:219-235`) with one helper that takes the session call as an async closure; verify the existing `source::smb::tests` still pass, in particular the cases that reconnect a stale session and that report a dropped connection
-- [ ] 3.2 Delete the unreachable "is not a share" error arm in `entry_for_source` (`crates/core/src/source/smb.rs:273-281`) now that `share_path` fails first with the same message; verify `cargo clippy --all-targets -- -D warnings` is clean and that the "sources the hub cannot serve report clean names" test still passes
-- [ ] 3.3 Make `ShareHub::is_connected` (`crates/core/src/source/smb.rs:162-172`) test-only, since only the hub's own tests call it; verify the hub's tests still compile and pass and that `cargo clippy --all-targets -- -D warnings` is clean
+- [x] 3.1 Replace the three copies of the ensure-live / try / rebuild-once sequence in `crates/core/src/source/smb.rs` (`list_dir` at `:179-195`, `open` at `:200-216`, `stat` at `:219-235`) with one helper that takes the session call as an async closure; verify the existing `source::smb::tests` still pass, in particular the cases that reconnect a stale session and that report a dropped connection
+- [x] 3.2 Delete the unreachable "is not a share" error arm in `entry_for_source` (`crates/core/src/source/smb.rs:273-281`) now that `share_path` fails first with the same message; verify `cargo clippy --all-targets -- -D warnings` is clean and that the "sources the hub cannot serve report clean names" test still passes
+- [x] 3.3 Make `ShareHub::is_connected` (`crates/core/src/source/smb.rs:162-172`) test-only, since only the hub's own tests call it; verify the hub's tests still compile and pass and that `cargo clippy --all-targets -- -D warnings` is clean
 
 ## 4. Core: one way to put an entry in the file list
 

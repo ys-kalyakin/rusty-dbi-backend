@@ -7,11 +7,17 @@
 //! or stat — everything else fails transparently. Errors are scrubbed so they
 //! never carry the password.
 
-use crate::source::{EntryKind, FileHandle, ListEntry, Source, SourceError, Sources};
+use crate::source::{EntryKind, FileHandle, ListEntry, SmbLocation, Source, SourceError, Sources};
 use async_trait::async_trait;
 use std::collections::HashMap;
 use std::fmt::Display;
+use std::future::Future;
+use std::pin::Pin;
 use std::sync::Arc;
+
+/// One share operation's future, boxed so that it can borrow the session it
+/// runs against.
+type SessionCall<'a, T> = Pin<Box<dyn Future<Output = Result<T, SourceError>> + Send + 'a>>;
 
 /// One configured share, password-free by construction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -159,7 +165,8 @@ impl ShareHub {
     }
 
     /// Whether the named share currently has a live session.
-    pub fn is_connected(&self, name: &str) -> bool {
+    #[cfg(test)]
+    pub(crate) fn is_connected(&self, name: &str) -> bool {
         self.shares
             .get(name)
             .map(|entry| {
@@ -177,56 +184,54 @@ impl ShareHub {
     /// listing are dropped here too: no list this source exposes may contain
     /// them, whatever session implementation is backing the share.
     pub async fn list_dir(&mut self, source: &Source) -> Result<Vec<ListEntry>, SourceError> {
-        let path = share_path(source)?.to_string();
-        let entry = entry_for_source(&mut self.shares, source)?;
-        ensure_live(entry, self.factory.as_ref()).await?;
-        let session = live_session(entry)?;
-        match session.list_dir(&path).await {
-            Ok(entries) => Ok(drop_dot_entries(entries)),
-            Err(first) => {
-                if entry.session.as_ref().is_some_and(|s| s.is_dead()) {
-                    rebuild(entry, self.factory.as_ref()).await?;
-                    Ok(drop_dot_entries(
-                        live_session(entry)?.list_dir(&path).await?,
-                    ))
-                } else {
-                    Err(first)
-                }
-            }
-        }
+        self.with_reconnect(source, |session, path| {
+            Box::pin(async move { session.list_dir(path).await })
+        })
+        .await
+        .map(drop_dot_entries)
     }
 
     /// Open a source's file, reconnecting a dead session once.
     pub async fn open(&mut self, source: &Source) -> Result<Box<dyn FileHandle>, SourceError> {
-        let path = share_path(source)?.to_string();
-        let entry = entry_for_source(&mut self.shares, source)?;
-        ensure_live(entry, self.factory.as_ref()).await?;
-        let session = live_session(entry)?;
-        match session.open(&path).await {
-            Ok(handle) => Ok(handle),
-            Err(first) => {
-                if entry.session.as_ref().is_some_and(|s| s.is_dead()) {
-                    rebuild(entry, self.factory.as_ref()).await?;
-                    live_session(entry)?.open(&path).await
-                } else {
-                    Err(first)
-                }
-            }
-        }
+        self.with_reconnect(source, |session, path| {
+            Box::pin(async move { session.open(path).await })
+        })
+        .await
     }
 
     /// Stat a source, reconnecting a dead session once.
     pub async fn stat(&mut self, source: &Source) -> Result<Option<ListEntry>, SourceError> {
-        let path = share_path(source)?.to_string();
-        let entry = entry_for_source(&mut self.shares, source)?;
+        self.with_reconnect(source, |session, path| {
+            Box::pin(async move { session.stat(path).await })
+        })
+        .await
+    }
+
+    /// Run one operation against the share's session, rebuilding a dead
+    /// session once and running the operation again.
+    ///
+    /// The operation is a closure so that every call site shares this
+    /// sequence — resolve the path, find the share, make sure the session is
+    /// alive, run, and on a dead session rebuild and run once more — without
+    /// repeating it. The future is boxed so it can borrow the session it runs
+    /// against.
+    async fn with_reconnect<T, F>(&mut self, source: &Source, call: F) -> Result<T, SourceError>
+    where
+        T: Send,
+        F: for<'x> Fn(&'x mut Box<dyn ShareSessionLike>, &'x str) -> SessionCall<'x, T>,
+    {
+        let location = share_location(source)?;
+        let path = location.path.clone();
+        let entry = entry_for(&mut self.shares, &location.share)?;
         ensure_live(entry, self.factory.as_ref()).await?;
         let session = live_session(entry)?;
-        match session.stat(&path).await {
-            Ok(entry) => Ok(entry),
+        match call(session, &path).await {
+            Ok(value) => Ok(value),
             Err(first) => {
                 if entry.session.as_ref().is_some_and(|s| s.is_dead()) {
                     rebuild(entry, self.factory.as_ref()).await?;
-                    live_session(entry)?.stat(&path).await
+                    let session = live_session(entry)?;
+                    call(session, &path).await
                 } else {
                     Err(first)
                 }
@@ -268,22 +273,10 @@ fn entry_for<'a>(
         .ok_or_else(|| SourceError::new(format!("share {name} is not configured")))
 }
 
-/// The configured entry a share source belongs to. Local sources are not this
-/// hub's business.
-fn entry_for_source<'a>(
-    shares: &'a mut HashMap<String, ShareEntry>,
-    source: &Source,
-) -> Result<&'a mut ShareEntry, SourceError> {
+/// A share source's location within its share.
+fn share_location(source: &Source) -> Result<&SmbLocation, SourceError> {
     match source {
-        Source::Smb(location) => entry_for(shares, &location.share),
-        _ => Err(SourceError::new(format!("{source} is not a share"))),
-    }
-}
-
-/// A share source's path within its share.
-fn share_path(source: &Source) -> Result<&str, SourceError> {
-    match source {
-        Source::Smb(location) => Ok(&location.path),
+        Source::Smb(location) => Ok(location),
         _ => Err(SourceError::new(format!("{source} is not a share"))),
     }
 }
