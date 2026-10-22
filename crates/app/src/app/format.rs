@@ -78,3 +78,12 @@ pub(crate) fn abbrev_path(path: &str, max_width: usize) -> String {
     let tail_str: String = chars[chars.len() - tail..].iter().collect();
     format!("{head_str}…{tail_str}")
 }
+
+/// A counted noun: "1 file" or "5 files". A zero count is plural, as English
+/// words it.
+pub(crate) fn plural(count: usize, one: &str, many: &str) -> String {
+    match count {
+        1 => format!("1 {one}"),
+        n => format!("{n} {many}"),
+    }
+}

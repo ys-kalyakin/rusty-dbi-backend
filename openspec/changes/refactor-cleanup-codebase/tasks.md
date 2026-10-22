@@ -53,9 +53,9 @@
 
 ## 9. App: one helper for each repeated piece of the UI
 
-- [ ] 9.1 Add one `render_centered_hint(title, text, area)` helper and use it for the three centred hints (`crates/app/src/app.rs:1322-1337`, `:1340-1358` and the empty-share-list branch at `:1545-1574`); verify the rendering tests for the no-match hint, the empty-file-list hint and the empty-share-list hint still pass
-- [ ] 9.2 Add one `render_table(title, rows, widths, selected, area)` helper and use it for the three tables (`crates/app/src/app.rs:1309-1318`, `:1529-1538` and `:1600-1607`), keeping each table's own widths, rows and clamped index; verify the rendering tests for the file list, the picker and the share list still pass
-- [ ] 9.3 Add one `plural(count, singular, plural)` helper and use it for the file count, the share count and the picker's entry and match counts (`crates/app/src/app.rs:1249-1253`, `:1500-1510` and `:1590-1594`); verify the rendering tests still show the same wording for one and for many
+- [x] 9.1 Add one `render_centered_hint(title, text, area)` helper and use it for the three centred hints (`crates/app/src/app.rs:1322-1337`, `:1340-1358` and the empty-share-list branch at `:1545-1574`); verify the rendering tests for the no-match hint, the empty-file-list hint and the empty-share-list hint still pass
+- [x] 9.2 Add one `render_table(title, rows, widths, selected, area)` helper and use it for the three tables (`crates/app/src/app.rs:1309-1318`, `:1529-1538` and `:1600-1607`), keeping each table's own widths, rows and clamped index; verify the rendering tests for the file list, the picker and the share list still pass
+- [x] 9.3 Add one `plural(count, singular, plural)` helper and use it for the file count, the share count and the picker's entry and match counts (`crates/app/src/app.rs:1249-1253`, `:1500-1510` and `:1590-1594`); verify the rendering tests still show the same wording for one and for many
 
 ## 10. App: one way to handle the repeated key cases
 

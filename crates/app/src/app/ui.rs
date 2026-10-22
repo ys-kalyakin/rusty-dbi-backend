@@ -9,7 +9,7 @@ use ratatui::Frame;
 
 use std::time::Duration;
 
-use super::format::{abbrev_path, format_elapsed, human_size, log_color};
+use super::format::{abbrev_path, format_elapsed, human_size, log_color, plural};
 use super::state::{
     App, ConfirmKind, Mode, PasswordModal, ServerStatus, ShareFormState, ShareList,
     SHARE_FORM_FIELDS,
@@ -138,11 +138,7 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::raw("  "),
         Span::styled(state_text, theme::fg(color)),
     ]);
-    let count = if app.files.len() == 1 {
-        "1 file".to_string()
-    } else {
-        format!("{} files", app.files.len())
-    };
+    let count = plural(app.files.len(), "file", "files");
     let right = format!("{count} · total: {}", human_size(app.files.total_size()));
     frame.render_widget(Paragraph::new(left), halves[0]);
     frame.render_widget(
@@ -171,7 +167,6 @@ fn render_files(frame: &mut Frame, app: &App, area: Rect) {
         widths.push(Constraint::Length(IDENTITY_WIDTH));
     }
     widths.push(Constraint::Min(8));
-    let widths: &[Constraint] = &widths;
     let rows: Vec<Row> = visible
         .iter()
         .map(|(name, entry)| {
@@ -198,55 +193,67 @@ fn render_files(frame: &mut Frame, app: &App, area: Rect) {
             Row::new(cells)
         })
         .collect();
-    let files = Table::new(rows, widths)
-        .block(theme::block_title("Files"))
+    let selected = (!visible.is_empty()).then(|| app.selected.min(visible.len() - 1));
+    render_table(frame, "Files".to_string(), rows, widths, selected, area);
+}
+
+/// The one way a centered hint is drawn against a titled list block: the
+/// three-band layout that puts the message one line above the middle.
+fn render_centered_hint(frame: &mut Frame, title: &'static str, text: String, area: Rect) {
+    let block = theme::block_title(title);
+    let inner = block.inner(area);
+    let bands = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([
+            Constraint::Percentage(45),
+            Constraint::Length(1),
+            Constraint::Percentage(55),
+        ])
+        .split(inner);
+    let hint = Paragraph::new(Span::styled(text, theme::muted())).alignment(Alignment::Center);
+    frame.render_widget(block, area);
+    frame.render_widget(hint, bands[1]);
+}
+
+/// The one way a list is drawn: a titled table with the column spacing, the
+/// highlight style and the `>` cursor the app uses everywhere, with the
+/// caller's own widths, rows and clamped selection.
+fn render_table(
+    frame: &mut Frame,
+    title: String,
+    rows: Vec<Row>,
+    widths: impl IntoIterator<Item = Constraint>,
+    selected: Option<usize>,
+    area: Rect,
+) {
+    let table = Table::new(rows, widths)
+        .block(theme::block_title(title))
         .column_spacing(2)
         .row_highlight_style(theme::selection())
         .highlight_symbol("> ");
     let mut state = TableState::default();
-    if !visible.is_empty() {
-        state.select(Some(app.selected.min(visible.len() - 1)));
-    }
-    frame.render_stateful_widget(files, area, &mut state);
+    state.select(selected);
+    frame.render_stateful_widget(table, area, &mut state);
 }
 
 /// A centered hint shown when the search matches none of the offered files.
 fn render_no_match_hint(frame: &mut Frame, area: Rect) {
-    let block = theme::block_title("Files");
-    let inner = block.inner(area);
-    let bands = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(45),
-            Constraint::Length(1),
-            Constraint::Percentage(55),
-        ])
-        .split(inner);
-    let hint = Paragraph::new(Span::styled("No file matches the search", theme::muted()))
-        .alignment(Alignment::Center);
-    frame.render_widget(block, area);
-    frame.render_widget(hint, bands[1]);
+    render_centered_hint(
+        frame,
+        "Files",
+        "No file matches the search".to_string(),
+        area,
+    );
 }
 
 /// A centered onboarding hint shown when no files are offered (picker closed).
 fn render_empty_files_hint(frame: &mut Frame, area: Rect) {
-    let block = theme::block_title("Files");
-    let inner = block.inner(area);
-    let bands = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([
-            Constraint::Percentage(45),
-            Constraint::Length(1),
-            Constraint::Percentage(55),
-        ])
-        .split(inner);
-    let hint = Paragraph::new(Span::styled(
-        "No files yet — press `a` to add files",
-        theme::muted(),
-    ))
-    .alignment(Alignment::Center);
-    frame.render_widget(block, area);
-    frame.render_widget(hint, bands[1]);
+    render_centered_hint(
+        frame,
+        "Files",
+        "No files yet — press `a` to add files".to_string(),
+        area,
+    );
 }
 
 /// The width the identity column takes: the title id, the kind of content and
@@ -390,15 +397,9 @@ fn render_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
         })
         .collect();
     let count = if picker.filter().is_empty() {
-        if picker.entries().len() == 1 {
-            "1 entry".to_string()
-        } else {
-            format!("{} entries", picker.entries().len())
-        }
-    } else if picker.entries().len() == 1 {
-        "1 match".to_string()
+        plural(picker.entries().len(), "entry", "entries")
     } else {
-        format!("{} matches", picker.entries().len())
+        plural(picker.entries().len(), "match", "matches")
     };
     let title = if picker.is_busy() {
         format!("Pick a path: {} · listing…", picker.origin_display())
@@ -418,16 +419,8 @@ fn render_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
         )
     };
     let widths = [Constraint::Min(8), Constraint::Length(10)];
-    let list = Table::new(rows, widths)
-        .block(theme::block_title(title))
-        .column_spacing(2)
-        .row_highlight_style(theme::selection())
-        .highlight_symbol("> ");
-    let mut state = TableState::default();
-    if !picker.entries().is_empty() {
-        state.select(Some(picker.cursor()));
-    }
-    frame.render_stateful_widget(list, area, &mut state);
+    let selected = (!picker.entries().is_empty()).then(|| picker.cursor());
+    render_table(frame, title, rows, widths, selected, area);
 }
 
 /// The share list: one row per configured share with its details, or a hint
@@ -435,33 +428,23 @@ fn render_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
 /// Files table (the server is idle while it is open).
 fn render_shares(frame: &mut Frame, app: &App, list: &ShareList, area: Rect) {
     if app.shares.is_empty() {
-        let block = theme::block_title("Shares");
-        let inner = block.inner(area);
-        let bands = Layout::default()
-            .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Percentage(45),
-                Constraint::Length(1),
-                Constraint::Percentage(55),
-            ])
-            .split(inner);
-        let hint = match &app.config_hint {
-            Some(path) => Paragraph::new(Span::styled(
+        match &app.config_hint {
+            Some(path) => render_centered_hint(
+                frame,
+                "Shares",
                 format!(
                     "No shares configured — press `a` to add one (saved to {})",
                     path.display()
                 ),
-                theme::muted(),
-            ))
-            .alignment(Alignment::Center),
-            None => Paragraph::new(Span::styled(
-                "No shares configured — press `a` to add one (no config path known)",
-                theme::muted(),
-            ))
-            .alignment(Alignment::Center),
-        };
-        frame.render_widget(block, area);
-        frame.render_widget(hint, bands[1]);
+                area,
+            ),
+            None => render_centered_hint(
+                frame,
+                "Shares",
+                "No shares configured — press `a` to add one (no config path known)".to_string(),
+                area,
+            ),
+        }
         return;
     }
 
@@ -479,24 +462,19 @@ fn render_shares(frame: &mut Frame, app: &App, list: &ShareList, area: Rect) {
             ])
         })
         .collect();
-    let count = if app.shares.len() == 1 {
-        "1 share".to_string()
-    } else {
-        format!("{} shares", app.shares.len())
-    };
-    let widths = [
-        Constraint::Min(8),
-        Constraint::Min(12),
-        Constraint::Length(12),
-    ];
-    let table = Table::new(rows, widths)
-        .block(theme::block_title(format!("Shares · {count}")))
-        .column_spacing(2)
-        .row_highlight_style(theme::selection())
-        .highlight_symbol("> ");
-    let mut state = TableState::default();
-    state.select(Some(list.selected.min(app.shares.len() - 1)));
-    frame.render_stateful_widget(table, area, &mut state);
+    let count = plural(app.shares.len(), "share", "shares");
+    render_table(
+        frame,
+        format!("Shares · {count}"),
+        rows,
+        [
+            Constraint::Min(8),
+            Constraint::Min(12),
+            Constraint::Length(12),
+        ],
+        Some(list.selected.min(app.shares.len() - 1)),
+        area,
+    );
 }
 
 fn render_confirm(frame: &mut Frame, kind: ConfirmKind, area: Rect) {
