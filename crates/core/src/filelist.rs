@@ -56,16 +56,12 @@ impl FileList {
     pub fn insert(&mut self, name: impl Into<String>, path: impl Into<PathBuf>) -> Option<Source> {
         let path = path.into();
         let size = file_size(&path);
-        self.files
-            .insert(
-                name.into(),
-                FileEntry {
-                    source: Source::Local(path),
-                    size,
-                    identity: TitleIdentity::default(),
-                },
-            )
-            .map(|entry| entry.source)
+        self.put(
+            name.into(),
+            Source::Local(path),
+            size,
+            TitleIdentity::default(),
+        )
     }
 
     /// Insert an exact entry: any source with a known size, no filesystem
@@ -76,13 +72,25 @@ impl FileList {
         source: Source,
         size: u64,
     ) -> Option<Source> {
+        self.put(name.into(), source, size, TitleIdentity::default())
+    }
+
+    /// Put one entry into the list under its name, returning the source it
+    /// replaced, if any.
+    fn put(
+        &mut self,
+        name: String,
+        source: Source,
+        size: u64,
+        identity: TitleIdentity,
+    ) -> Option<Source> {
         self.files
             .insert(
-                name.into(),
+                name,
                 FileEntry {
                     source,
                     size,
-                    identity: TitleIdentity::default(),
+                    identity,
                 },
             )
             .map(|entry| entry.source)
@@ -222,18 +230,7 @@ impl FileList {
             other => other,
         };
         if let Some(name) = resolved.file_name() {
-            if self
-                .files
-                .insert(
-                    name.clone(),
-                    FileEntry {
-                        source: resolved,
-                        size,
-                        identity,
-                    },
-                )
-                .is_some()
-            {
+            if self.put(name.clone(), resolved, size, identity).is_some() {
                 outcome.replaced.push(name.clone());
             }
             outcome.added.push(name);

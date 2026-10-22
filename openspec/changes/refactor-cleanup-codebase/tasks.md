@@ -20,8 +20,8 @@
 
 ## 4. Core: one way to put an entry in the file list
 
-- [ ] 4.1 Extract the map insertion shared by `FileList::insert` (`crates/core/src/filelist.rs:56-69`), `FileList::insert_source` (`:73-89`) and `FileList::record` (`:211-241`) into one private helper, keeping `insert` and `insert_source` free of canonicalisation and of replacement reporting and keeping `record`'s canonicalisation and replacement reporting exactly as they are; verify the filelist unit tests and `crates/core/tests/server_test.rs` still pass, including the duplicate-name replacement case
-- [ ] 4.2 Confirm that adding an entry whose name already exists still reports the replacement and that `FileList::insert` used by the integration tests still overwrites silently; verify with the existing "Duplicate names overwrite" case and with `crates/core/tests/server_test.rs`
+- [x] 4.1 Extract the map insertion shared by `FileList::insert` (`crates/core/src/filelist.rs:56-69`), `FileList::insert_source` (`:73-89`) and `FileList::record` (`:211-241`) into one private helper, keeping `insert` and `insert_source` free of canonicalisation and of replacement reporting and keeping `record`'s canonicalisation and replacement reporting exactly as they are; verify the filelist unit tests and `crates/core/tests/server_test.rs` still pass, including the duplicate-name replacement case
+- [x] 4.2 Confirm that adding an entry whose name already exists still reports the replacement and that `FileList::insert` used by the integration tests still overwrites silently; verify with the existing "Duplicate names overwrite" case and with `crates/core/tests/server_test.rs`
 
 ## 5. Core: share the helpers that were written twice
 
