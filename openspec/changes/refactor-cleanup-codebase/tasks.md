@@ -64,8 +64,8 @@
 
 ## 11. App: validate a share in one place
 
-- [ ] 11.1 Extract the shared share rules — required fields, the default port 445, the `host:port` split, the empty domain and the trimmed root — out of `config::parse_share` (`crates/app/src/config.rs:48-82`) and `config::build_share` (`:102-158`) into one function, keeping each caller's own error shape (`String` versus `Vec<String>`) and its own message wording; verify the config tests and the share-form tests still assert the same messages
-- [ ] 11.2 Add the named constant for the default SMB port, used by `parse_share`, `build_share` and the share setup (`crates/app/src/config.rs:93`, `:130`, `:136` and `:251`), replacing the four bare `445` literals; verify the share tests still connect to the default port
+- [x] 11.1 Extract the shared share rules — required fields, the default port 445, the `host:port` split, the empty domain and the trimmed root — out of `config::parse_share` (`crates/app/src/config.rs:48-82`) and `config::build_share` (`:102-158`) into one function, keeping each caller's own error shape (`String` versus `Vec<String>`) and its own message wording; verify the config tests and the share-form tests still assert the same messages
+- [x] 11.2 Add the named constant for the default SMB port, used by `parse_share`, `build_share` and the share setup (`crates/app/src/config.rs:93`, `:130`, `:136` and `:251`), replacing the four bare `445` literals; verify the share tests still connect to the default port
 
 ## 12. App: let the picker use the shared core types
 

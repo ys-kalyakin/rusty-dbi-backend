@@ -12,6 +12,9 @@ use std::path::{Path, PathBuf};
 
 pub use dbi_backend_core::source::smb::ShareConfig;
 
+/// The port an SMB share speaks on when its `server` names none.
+const DEFAULT_SMB_PORT: u16 = 445;
+
 /// The configuration file's `[[shares]]` entries.
 #[derive(Deserialize, Default)]
 struct ConfigFile {
@@ -66,22 +69,16 @@ fn parse_share(entry: &toml::Table) -> Result<ShareConfig, String> {
     };
     let root = match entry.get("root") {
         None => String::new(),
-        Some(toml::Value::String(value)) => value.trim_matches('/').to_string(),
+        Some(toml::Value::String(value)) => value.clone(),
         Some(_) => return Err("root must be a string".to_string()),
     };
     let (host, port) = parse_server(&server)?;
-    Ok(ShareConfig {
-        name,
-        host,
-        port,
-        share,
-        username,
-        domain,
-        root,
-    })
+    Ok(share_from_parts(
+        name, host, port, share, username, domain, &root,
+    ))
 }
 
-/// `host` defaults to port 445; `host:port` pins another one.
+/// `host` defaults to the SMB port; `host:port` pins another one.
 fn parse_server(server: &str) -> Result<(String, u16), String> {
     match server.rsplit_once(':') {
         Some((host, port)) => {
@@ -90,7 +87,31 @@ fn parse_server(server: &str) -> Result<(String, u16), String> {
                 .map_err(|_| format!("bad port in server {server:?}"))?;
             Ok((host.to_string(), port))
         }
-        None => Ok((server.to_string(), 445)),
+        None => Ok((server.to_string(), DEFAULT_SMB_PORT)),
+    }
+}
+
+/// The one place the share's fields take their shape: the required fields as
+/// given, the domain as the caller normalised it, and the root without its
+/// surrounding slashes. Both ways a share starts life — the config file and
+/// the add-share form — come through here, so neither can drift.
+fn share_from_parts(
+    name: String,
+    host: String,
+    port: u16,
+    share: String,
+    username: String,
+    domain: Option<String>,
+    root: &str,
+) -> ShareConfig {
+    ShareConfig {
+        name,
+        host,
+        port,
+        share,
+        username,
+        domain,
+        root: root.trim_matches('/').to_string(),
     }
 }
 
@@ -127,13 +148,13 @@ pub fn build_share(
     // The port parse is only tried once the server is present; a missing
     // server is already on the list.
     let (host, port) = if server.is_empty() {
-        (String::new(), 445)
+        (String::new(), DEFAULT_SMB_PORT)
     } else {
         match parse_server(server) {
             Ok(parts) => parts,
             Err(e) => {
                 errors.push(e);
-                (String::new(), 445)
+                (String::new(), DEFAULT_SMB_PORT)
             }
         }
     };
@@ -143,15 +164,15 @@ pub fn build_share(
         Some(domain.to_string())
     };
     if errors.is_empty() {
-        Ok(ShareConfig {
-            name: name.to_string(),
+        Ok(share_from_parts(
+            name.to_string(),
             host,
             port,
-            share: share.to_string(),
-            username: username.to_string(),
+            share.to_string(),
+            username.to_string(),
             domain,
-            root: root.trim_matches('/').to_string(),
-        })
+            root,
+        ))
     } else {
         Err(errors)
     }
@@ -248,7 +269,7 @@ pub fn config_path() -> Option<PathBuf> {
 /// A configured share's `server` value in the file's dialect: `host` when the
 /// port is the SMB default, `host:port` otherwise.
 fn server_string(config: &ShareConfig) -> String {
-    if config.port == 445 {
+    if config.port == DEFAULT_SMB_PORT {
         config.host.clone()
     } else {
         format!("{}:{}", config.host, config.port)
