@@ -8,7 +8,8 @@ use super::state::{
     clamped_step, Action, App, ConfirmKind, Mode, PasswordModal, ServerStatus, ShareFormState,
     ShareList,
 };
-use crate::picker::{Kind, Picker};
+use crate::picker::Picker;
+use dbi_backend_core::source::EntryKind;
 
 /// The character a typed value accepts: any character that is not a control
 /// character. Today's keys send characters in that set and nothing else; the
@@ -82,7 +83,7 @@ impl App {
                         None => Outcome::None,
                     },
                     KeyCode::Enter => {
-                        if picker.current().map(|e| e.kind) == Some(Kind::Dir) {
+                        if picker.current().map(|e| e.kind) == Some(EntryKind::Dir) {
                             picker.descend();
                             // Only share origins list asynchronously.
                             match picker.reload_request() {

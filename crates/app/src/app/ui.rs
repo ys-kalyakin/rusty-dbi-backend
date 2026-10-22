@@ -14,8 +14,9 @@ use super::state::{
     App, ConfirmKind, Mode, PasswordModal, ServerStatus, ShareFormState, ShareList,
     SHARE_FORM_FIELDS,
 };
-use crate::picker::{Kind, Picker};
+use crate::picker::Picker;
 use crate::theme;
+use dbi_backend_core::source::EntryKind;
 
 /// Hint line shown while the picker is open.
 const PICKER_HINT: &str = "Esc cancel  Enter open  Space add  Bksp up  / filter";
@@ -383,8 +384,8 @@ fn render_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
         .iter()
         .map(|entry| {
             let (name, name_style, size) = match entry.kind {
-                Kind::Dir => (format!("{}/", entry.name), theme::accent(), String::new()),
-                Kind::File => (
+                EntryKind::Dir => (format!("{}/", entry.name), theme::accent(), String::new()),
+                EntryKind::File => (
                     entry.name.clone(),
                     theme::text(),
                     entry.size.map(human_size).unwrap_or_default(),
@@ -402,19 +403,19 @@ fn render_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
         plural(picker.entries().len(), "match", "matches")
     };
     let title = if picker.is_busy() {
-        format!("Pick a path: {} · listing…", picker.origin_display())
+        format!("Pick a path: {} · listing…", picker.origin().display())
     } else if picker.error().is_some() {
         format!(
             "Pick a path: {} · {}",
-            picker.origin_display(),
+            picker.origin().display(),
             picker.error().unwrap()
         )
     } else if picker.filter().is_empty() {
-        format!("Pick a path: {} · {count}", picker.origin_display())
+        format!("Pick a path: {} · {count}", picker.origin().display())
     } else {
         format!(
             "Pick a path: {}  [filter: {}] · {count}",
-            picker.origin_display(),
+            picker.origin().display(),
             picker.filter()
         )
     };

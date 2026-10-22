@@ -2016,7 +2016,7 @@ fn a_connected_share_opens_the_picker_at_its_root() {
     match &app.mode {
         Mode::Picker(picker) => {
             assert!(picker.is_busy(), "the root listing is pending");
-            assert_eq!(picker.origin_display(), "Games:/library/switch");
+            assert_eq!(picker.origin().display(), "Games:/library/switch");
         }
         _ => panic!("expected the picker after a successful connect"),
     }
@@ -2117,7 +2117,7 @@ fn enter_on_a_share_directory_requests_its_listing_through_the_action() {
     );
     match &app.mode {
         Mode::Picker(picker) => {
-            assert_eq!(picker.origin_display(), "Games:/Switch");
+            assert_eq!(picker.origin().display(), "Games:/Switch");
             assert_eq!(picker.entries().len(), 1);
             assert!(!picker.is_busy());
         }
@@ -2140,7 +2140,7 @@ fn bksp_in_a_share_requests_the_parent_listing_and_stops_at_the_root() {
     let action = app.handle_key(key(KeyCode::Backspace));
     assert_eq!(action, Action::None);
     match &app.mode {
-        Mode::Picker(picker) => assert_eq!(picker.origin_display(), "Games:/"),
+        Mode::Picker(picker) => assert_eq!(picker.origin().display(), "Games:/"),
         _ => panic!("expected the picker"),
     }
 }

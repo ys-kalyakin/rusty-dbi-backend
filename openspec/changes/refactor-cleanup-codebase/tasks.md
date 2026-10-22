@@ -69,9 +69,9 @@
 
 ## 12. App: let the picker use the shared core types
 
-- [ ] 12.1 Delete the app-local `picker::Kind` enum (`crates/app/src/picker.rs:11-16`) and the mapping at `:168-171`, and use `dbi_backend_core::source::EntryKind` throughout the picker; verify the picker tests and the app's picker tests still pass
-- [ ] 12.2 Replace `join_share` (`crates/app/src/picker.rs:357-363`) and `parent_share_path` (`:367-375`) with `SmbLocation::join` and `SmbLocation::parent_path` from core, keeping the picker's "go up lands on the share root" behaviour for a top-level entry; verify the picker tests for going up from a subdirectory and for going up at the share root still pass
-- [ ] 12.3 Delete the `Picker::origin_display` pass-through (`crates/app/src/picker.rs:224-226`) and call `Origin::display` directly from its one caller; verify the picker and app tests still assert the same location strings
+- [x] 12.1 Delete the app-local `picker::Kind` enum (`crates/app/src/picker.rs:11-16`) and the mapping at `:168-171`, and use `dbi_backend_core::source::EntryKind` throughout the picker; verify the picker tests and the app's picker tests still pass
+- [x] 12.2 Replace `join_share` (`crates/app/src/picker.rs:357-363`) and `parent_share_path` (`:367-375`) with `SmbLocation::join` and `SmbLocation::parent_path` from core, keeping the picker's "go up lands on the share root" behaviour for a top-level entry; verify the picker tests for going up from a subdirectory and for going up at the share root still pass
+- [x] 12.3 Delete the `Picker::origin_display` pass-through (`crates/app/src/picker.rs:224-226`) and call `Origin::display` directly from its one caller; verify the picker and app tests still assert the same location strings
 
 ## 13. Final verification
 
