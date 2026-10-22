@@ -750,7 +750,7 @@ mod tests {
 
     /// Tests for [`FileList::add_source`], running against [`MemStore`] and a
     /// small wrapper that can deny listings like an unreadable share directory.
-    #[cfg(feature = "test-util")]
+    #[cfg(test)]
     mod add_source_tests {
         use super::*;
         use crate::source::local::LocalStore;

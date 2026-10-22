@@ -3,7 +3,7 @@
 
 pub mod local;
 pub mod smb;
-#[cfg(feature = "test-util")]
+#[cfg(test)]
 pub mod testutil;
 
 use async_trait::async_trait;

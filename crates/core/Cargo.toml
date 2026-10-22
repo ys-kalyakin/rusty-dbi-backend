@@ -8,9 +8,6 @@ license.workspace = true
 name = "dbi_backend_core"
 path = "src/lib.rs"
 
-[features]
-test-util = []
-
 [dependencies]
 async-trait.workspace = true
 thiserror.workspace = true
