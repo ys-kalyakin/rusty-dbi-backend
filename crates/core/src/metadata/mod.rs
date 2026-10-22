@@ -4,6 +4,8 @@
 pub mod cnmt;
 pub mod container;
 pub mod filename;
+#[cfg(test)]
+pub(crate) mod fixtures;
 
 use crate::source::FileHandle;
 
@@ -64,14 +66,20 @@ impl TitleIdentity {
     }
 }
 
+/// A version encoded as `major << 16 | minor << 8 | patch`, split into its
+/// three parts. Both the content meta header and a bracketed version group
+/// carry a version this way.
+pub(crate) fn split_version(raw: u32) -> (u8, u8, u8) {
+    ((raw >> 16) as u8, (raw >> 8) as u8, raw as u8)
+}
+
 /// Whether a file's name marks it as a container the reader knows: the
 /// archive formats a title is offered in.
 pub fn is_container_file(name: &str) -> bool {
-    let extension = match std::path::Path::new(name).extension() {
-        Some(extension) => extension.to_string_lossy().to_ascii_lowercase(),
-        None => return false,
-    };
-    matches!(extension.as_str(), "nsp" | "nsz")
+    match crate::filters::extension_of(name) {
+        Some(extension) => crate::filters::DEFAULT_EXTENSIONS.contains(&extension.as_str()),
+        None => false,
+    }
 }
 
 /// Read the identity of a file: from its container when the container exposes
@@ -104,70 +112,12 @@ fn merge(container: Option<cnmt::ContentMeta>, name: filename::NameIdentity) -> 
 
 #[cfg(test)]
 mod tests {
+    use super::fixtures::{content_meta, Memory};
     use super::*;
-    use crate::source::{FileHandle, SourceError};
-    use async_trait::async_trait;
-
-    /// A handle over a fixed buffer: the whole file is in memory.
-    struct Memory {
-        bytes: Vec<u8>,
-    }
-
-    impl Memory {
-        fn new(bytes: Vec<u8>) -> Self {
-            Self { bytes }
-        }
-    }
-
-    #[async_trait]
-    impl FileHandle for Memory {
-        async fn read_at(&mut self, buf: &mut [u8], offset: u64) -> Result<usize, SourceError> {
-            let start = offset as usize;
-            if start >= self.bytes.len() {
-                return Ok(0);
-            }
-            let count = buf.len().min(self.bytes.len() - start);
-            buf[..count].copy_from_slice(&self.bytes[start..start + count]);
-            Ok(count)
-        }
-
-        async fn size(&self) -> Option<u64> {
-            Some(self.bytes.len() as u64)
-        }
-    }
 
     /// A container holding one content meta, built the way the format says.
-    pub fn container_with_meta(meta: &[u8]) -> Vec<u8> {
-        let name = "meta.cnmt.npdm";
-        let mut name_table: Vec<u8> = Vec::new();
-        name_table.extend_from_slice(name.as_bytes());
-        name_table.push(0);
-        let mut out: Vec<u8> = Vec::new();
-        out.extend_from_slice(b"PFS0");
-        out.extend_from_slice(&1u32.to_le_bytes());
-        out.extend_from_slice(&(name_table.len() as u32).to_le_bytes());
-        out.extend_from_slice(&[0, 0, 0, 0]);
-        out.extend_from_slice(&0u64.to_le_bytes()); // the member's offset in the body
-        out.extend_from_slice(&(meta.len() as u64).to_le_bytes()); // the member's size
-        out.extend_from_slice(&0u32.to_le_bytes()); // the name's offset in the table
-        out.extend_from_slice(&[0, 0, 0, 0]);
-        out.extend_from_slice(&name_table);
-        out.extend_from_slice(meta);
-        out
-    }
-
-    /// A content meta header: title id, version and type.
-    pub fn content_meta(title_id: u64, version: u32, content_type: u8) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&title_id.to_le_bytes());
-        out.extend_from_slice(&version.to_le_bytes());
-        out.push(content_type);
-        out.push(0);
-        out.extend_from_slice(&0u16.to_le_bytes()); // extended header size
-        out.extend_from_slice(&0u16.to_le_bytes()); // content count
-        out.extend_from_slice(&0u16.to_le_bytes()); // content meta count
-        out.extend_from_slice(&[0u8; 0x10]);
-        out
+    fn container_with_meta(meta: &[u8]) -> Vec<u8> {
+        fixtures::container(&[("meta.cnmt.npdm", meta.to_vec())], false, false)
     }
 
     #[tokio::test]

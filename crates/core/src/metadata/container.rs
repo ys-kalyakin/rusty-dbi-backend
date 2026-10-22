@@ -6,14 +6,14 @@ use crate::source::FileHandle;
 use super::cnmt;
 
 /// The container's marker: the four bytes every member table starts with.
-const MAGIC: &[u8; 4] = b"PFS0";
+pub(super) const MAGIC: &[u8; 4] = b"PFS0";
 
 /// The fixed part of the header: the marker, the member count, the name-table
 /// size and four reserved bytes.
-const HEADER_LEN: usize = 0x10;
+pub(super) const HEADER_LEN: usize = 0x10;
 
 /// The size of one member's entry in the table.
-const ENTRY_LEN: usize = 0x18;
+pub(super) const ENTRY_LEN: usize = 0x18;
 
 /// The largest table of contents the reader accepts: a name table and the
 /// member entries must fit in the file, and a file that claims more is
@@ -177,119 +177,23 @@ async fn read_exact(handle: &mut dyn FileHandle, offset: u64, buf: &mut [u8]) ->
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::source::{FileHandle, SourceError};
-    use async_trait::async_trait;
-
-    struct Memory {
-        bytes: Vec<u8>,
-    }
-
-    impl Memory {
-        fn new(bytes: Vec<u8>) -> Self {
-            Self { bytes }
-        }
-    }
-
-    #[async_trait]
-    impl FileHandle for Memory {
-        async fn read_at(&mut self, buf: &mut [u8], offset: u64) -> Result<usize, SourceError> {
-            let start = offset as usize;
-            if start >= self.bytes.len() {
-                return Ok(0);
-            }
-            let count = buf.len().min(self.bytes.len() - start);
-            buf[..count].copy_from_slice(&self.bytes[start..start + count]);
-            Ok(count)
-        }
-
-        async fn size(&self) -> Option<u64> {
-            Some(self.bytes.len() as u64)
-        }
-    }
+    use crate::metadata::fixtures::{container as build_container, Memory};
 
     /// A container with the given members, each holding `body`. The name
-    /// table is UTF-8, the way the tools that write containers spell it, and
-    /// an entry's name index is the byte offset of its name in that table.
+    /// table is UTF-8, the way the tools that write containers spell it.
     fn container(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
-        container_with(members, false)
+        build_container(members, false, false)
     }
 
     /// A container whose name table is UTF-16, the way the console spells it.
     fn container_utf16(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
-        container_with(members, true)
-    }
-
-    fn container_with(members: &[(&str, Vec<u8>)], utf16: bool) -> Vec<u8> {
-        let mut name_table: Vec<u8> = Vec::new();
-        let mut offsets: Vec<u64> = Vec::new();
-        let mut name_offsets: Vec<u32> = Vec::new();
-        let mut body: Vec<u8> = Vec::new();
-        for (name, bytes) in members {
-            offsets.push(body.len() as u64);
-            body.extend_from_slice(bytes);
-            name_offsets.push(name_table.len() as u32);
-            if utf16 {
-                for unit in name.encode_utf16() {
-                    name_table.extend_from_slice(&unit.to_le_bytes());
-                }
-                name_table.extend_from_slice(&[0, 0]);
-            } else {
-                name_table.extend_from_slice(name.as_bytes());
-                name_table.push(0);
-            }
-        }
-        let header_len = HEADER_LEN + members.len() * ENTRY_LEN + name_table.len();
-        let mut out: Vec<u8> = Vec::new();
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&(members.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(name_table.len() as u32).to_le_bytes());
-        out.extend_from_slice(&[0, 0, 0, 0]);
-        for (index, offset) in offsets.iter().enumerate() {
-            out.extend_from_slice(&offset.to_le_bytes());
-            out.extend_from_slice(&members[index].1.len().to_le_bytes());
-            out.extend_from_slice(&name_offsets[index].to_le_bytes());
-            out.extend_from_slice(&[0, 0, 0, 0]);
-        }
-        out.extend_from_slice(&name_table);
-        debug_assert_eq!(out.len(), header_len);
-        out.extend_from_slice(&body);
-        out
+        build_container(members, true, false)
     }
 
     /// A container built the way the tools that write containers build it:
-    /// the name table is UTF-8 and padded to a 0x20 boundary, and a member's
-    /// offset counts from the end of the header.
+    /// the name table is UTF-8 and padded to a 0x20 boundary.
     fn container_as_the_tools_write_it(members: &[(&str, Vec<u8>)]) -> Vec<u8> {
-        let mut name_table: Vec<u8> = Vec::new();
-        let mut name_offsets: Vec<u32> = Vec::new();
-        let mut body: Vec<u8> = Vec::new();
-        for (name, bytes) in members {
-            name_offsets.push(name_table.len() as u32);
-            name_table.extend_from_slice(name.as_bytes());
-            name_table.push(0);
-            body.extend_from_slice(bytes);
-        }
-        // The table is padded so the header ends on a 0x20 boundary.
-        let header_size = HEADER_LEN + members.len() * ENTRY_LEN + name_table.len();
-        let padding = 0x20 - header_size % 0x20;
-        name_table.extend(std::iter::repeat_n(0u8, padding));
-
-        let mut out: Vec<u8> = Vec::new();
-        out.extend_from_slice(MAGIC);
-        out.extend_from_slice(&(members.len() as u32).to_le_bytes());
-        out.extend_from_slice(&(name_table.len() as u32).to_le_bytes());
-        out.extend_from_slice(&[0, 0, 0, 0]);
-        let mut offset = 0u64;
-        for (index, (_, bytes)) in members.iter().enumerate() {
-            out.extend_from_slice(&offset.to_le_bytes());
-            out.extend_from_slice(&(bytes.len() as u64).to_le_bytes());
-            out.extend_from_slice(&name_offsets[index].to_le_bytes());
-            out.extend_from_slice(&[0, 0, 0, 0]);
-            offset += bytes.len() as u64;
-        }
-        out.extend_from_slice(&name_table);
-        out.extend_from_slice(&body);
-        out
+        build_container(members, false, true)
     }
 
     #[tokio::test]

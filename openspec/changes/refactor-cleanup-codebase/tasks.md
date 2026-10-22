@@ -25,10 +25,10 @@
 
 ## 5. Core: share the helpers that were written twice
 
-- [ ] 5.1 Add one `split_version(raw: u32) -> (u8, u8, u8)` in `crates/core/src/metadata/mod.rs` and use it from `cnmt.rs:52-56` and `filename.rs:80`; verify the metadata unit tests still decode the same title ids and versions
-- [ ] 5.2 Share one untrimmed `extension_of` between `crates/core/src/filters.rs:165-169` and `crates/core/src/metadata/mod.rs:69-75`, keeping the trimming `normalize_extension` (`filters.rs:157-162`) for the config side only, and share the accepted-extension set so `is_container_file` and the filter defaults cannot drift apart; verify the filter tests still accept `GAME.NSP` and `Patch.NsZ` and still reject a name with a trailing space in its extension
-- [ ] 5.3 Replace the two identical in-memory `FileHandle` fakes (`crates/core/src/metadata/mod.rs:111-137` and `crates/core/src/metadata/container.rs:183-208`) with one shared fake, and the two identical content-meta builders (`metadata/mod.rs:160-171` and `cnmt.rs:76-87`) with one; verify the metadata and container unit tests still pass
-- [ ] 5.4 Replace the five hand-written PFS0 container builders (`crates/core/src/metadata/container.rs:213-293` and `crates/core/src/metadata/mod.rs:140-157`) with one parameterised builder; verify the container unit tests still pass, including the UTF-16 and the padded-table cases
+- [x] 5.1 Add one `split_version(raw: u32) -> (u8, u8, u8)` in `crates/core/src/metadata/mod.rs` and use it from `cnmt.rs:52-56` and `filename.rs:80`; verify the metadata unit tests still decode the same title ids and versions
+- [x] 5.2 Share one untrimmed `extension_of` between `crates/core/src/filters.rs:165-169` and `crates/core/src/metadata/mod.rs:69-75`, keeping the trimming `normalize_extension` (`filters.rs:157-162`) for the config side only, and share the accepted-extension set so `is_container_file` and the filter defaults cannot drift apart; verify the filter tests still accept `GAME.NSP` and `Patch.NsZ` and still reject a name with a trailing space in its extension
+- [x] 5.3 Replace the two identical in-memory `FileHandle` fakes (`crates/core/src/metadata/mod.rs:111-137` and `crates/core/src/metadata/container.rs:183-208`) with one shared fake, and the two identical content-meta builders (`metadata/mod.rs:160-171` and `cnmt.rs:76-87`) with one; verify the metadata and container unit tests still pass
+- [x] 5.4 Replace the five hand-written PFS0 container builders (`crates/core/src/metadata/container.rs:213-293` and `crates/core/src/metadata/mod.rs:140-157`) with one parameterised builder; verify the container unit tests still pass, including the UTF-16 and the padded-table cases
 
 ## 6. Core: split the file-range handler and drop its excess copies
 

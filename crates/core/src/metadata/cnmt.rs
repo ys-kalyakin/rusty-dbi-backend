@@ -49,11 +49,7 @@ pub fn parse(bytes: &[u8]) -> Option<ContentMeta> {
     let raw_version = u32::from_le_bytes(bytes[8..12].try_into().ok()?);
     Some(ContentMeta {
         title_id,
-        version: (
-            (raw_version >> 16) as u8,
-            (raw_version >> 8) as u8,
-            raw_version as u8,
-        ),
+        version: super::split_version(raw_version),
         content_type: bytes[12],
     })
 }
@@ -71,19 +67,11 @@ fn title_id(bytes: &[u8]) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::fixtures::content_meta;
 
     /// A content meta header: title id, version and type.
     fn meta(title_id: u64, version: u32, content_type: u8) -> Vec<u8> {
-        let mut out = Vec::new();
-        out.extend_from_slice(&title_id.to_le_bytes());
-        out.extend_from_slice(&version.to_le_bytes());
-        out.push(content_type);
-        out.push(0);
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&0u16.to_le_bytes());
-        out.extend_from_slice(&[0u8; 0x10]);
-        out
+        content_meta(title_id, version, content_type)
     }
 
     #[test]

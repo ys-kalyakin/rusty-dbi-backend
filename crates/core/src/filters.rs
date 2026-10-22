@@ -161,8 +161,10 @@ fn normalize_extension(extension: &str) -> String {
         .to_ascii_lowercase()
 }
 
-/// The lowercased extension of a file name, if it has one.
-fn extension_of(name: &str) -> Option<String> {
+/// The lowercased extension of a file name, if it has one. The extension is
+/// taken as it stands: a name whose extension carries a stray space does not
+/// match an accepted extension.
+pub(crate) fn extension_of(name: &str) -> Option<String> {
     Path::new(name)
         .extension()
         .map(|e| e.to_string_lossy().to_ascii_lowercase())

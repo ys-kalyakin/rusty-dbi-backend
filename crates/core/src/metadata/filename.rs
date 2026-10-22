@@ -77,7 +77,7 @@ fn parse_version(group: &str) -> Option<(u8, u8, u8)> {
     if raw == 0 {
         return None;
     }
-    Some(((raw >> 16) as u8, (raw >> 8) as u8, raw as u8))
+    Some(super::split_version(raw))
 }
 
 #[cfg(test)]
