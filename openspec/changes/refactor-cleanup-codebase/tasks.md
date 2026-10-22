@@ -8,9 +8,9 @@
 
 ## 2. Core: remove the dead protocol and source items
 
-- [ ] 2.1 Delete `CMD_ID_LIST_OLD` from `crates/core/src/protocol.rs:11`; verify `cargo clippy --all-targets -- -D warnings` is clean and `crates/core/tests/server_test.rs` still passes, including the case that sends an unknown command id
-- [ ] 2.2 Add `SmbLocation::join(&self, name: &str) -> SmbLocation` and `SmbLocation::parent_path(&self) -> Option<String>` to `crates/core/src/source/mod.rs`, with `parent_path` yielding `None` at the share root and `Some("")` for a top-level entry's parent; verify with unit tests that `join` yields `name` at the root and `{path}/{name}` below it, and that `parent_path` yields `None` for the empty path, `Some("")` for `"a"` and `Some("dir")` for `"dir/a"`
-- [ ] 2.3 Delete `Source::join` and `Source::parent` from `crates/core/src/source/mod.rs`; verify `cargo clippy --all-targets -- -D warnings` reports no dead code and the whole workspace still compiles
+- [x] 2.1 Delete `CMD_ID_LIST_OLD` from `crates/core/src/protocol.rs:11`; verify `cargo clippy --all-targets -- -D warnings` is clean and `crates/core/tests/server_test.rs` still passes, including the case that sends an unknown command id
+- [x] 2.2 Add `SmbLocation::join(&self, name: &str) -> SmbLocation` and `SmbLocation::parent_path(&self) -> Option<String>` to `crates/core/src/source/mod.rs`, with `parent_path` yielding `None` at the share root and `Some("")` for a top-level entry's parent; verify with unit tests that `join` yields `name` at the root and `{path}/{name}` below it, and that `parent_path` yields `None` for the empty path, `Some("")` for `"a"` and `Some("dir")` for `"dir/a"`
+- [x] 2.3 Delete `Source::parent` from `crates/core/src/source/mod.rs` and make `Source::join` delegate its share arm to `SmbLocation::join`, so the share-path arithmetic exists once; verify `cargo clippy --all-targets -- -D warnings` reports no dead code and the whole workspace still compiles
 
 ## 3. Core: one reconnect path in the share hub
 

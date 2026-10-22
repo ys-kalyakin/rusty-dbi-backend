@@ -8,7 +8,6 @@ pub const HEADER_LEN: usize = 16;
 pub const BUFFER_SEGMENT_DATA_SIZE: usize = 0x100000;
 
 pub const CMD_ID_EXIT: u32 = 0;
-pub const CMD_ID_LIST_OLD: u32 = 1;
 pub const CMD_ID_FILE_RANGE: u32 = 2;
 pub const CMD_ID_LIST: u32 = 3;
 

@@ -193,7 +193,9 @@ impl SmbLocation {
 }
 ```
 
-`Source::join` and `Source::parent` are deleted.
+`Source::parent` is deleted. `Source::join` stays — the share walk calls it at
+`crates/core/src/filelist.rs:296` — but its share arm now delegates to
+`SmbLocation::join`, so the path arithmetic exists once.
 
 `SmbLocation::join` is exactly `join_share` (`picker.rs:357-363`): both yield
 `name` when the path is empty and `{path}/{name}` otherwise.
@@ -312,7 +314,7 @@ than an explicit helper.
 | item | where | why it is safe |
 |---|---|---|
 | `CMD_ID_LIST_OLD` | `protocol.rs:11` | the command loop already ignores every id it does not match, and the protocol spec says unknown ids are ignored |
-| `Source::join`, `Source::parent` | `source/mod.rs:38-73` | no call sites; `join` is replaced by `SmbLocation::join` and `parent` by `SmbLocation::parent_path`, which have the contracts the app actually used |
+| `Source::join`, `Source::parent` | `source/mod.rs:38-73` | `Source::parent` has no call site and its contract differed from the only caller that existed, so it is deleted; `Source::join` is called by the share walk (`filelist.rs:296`) and stays, but its share arm delegates to `SmbLocation::join` so the path arithmetic exists once |
 | `App::new` and its `allow(dead_code)` | `app.rs:285-288` | the only production constructor is `App::with_shares`; `App::new` is called from the test module only |
 | `Action::Connect.selection` | `app.rs:52` | `main.rs:149` discards it and the app already sets the share-list selection itself at `app.rs:901-903`; only a test read it |
 | `App::share_added`'s return value | `app.rs:935` | `main.rs:182` discards it; the function's effect is the mutation |

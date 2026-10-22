@@ -17,6 +17,34 @@ pub struct SmbLocation {
     pub path: String,
 }
 
+impl SmbLocation {
+    /// The child location named `name` inside this one. The share root has no
+    /// leading or trailing slash.
+    pub fn join(&self, name: &str) -> SmbLocation {
+        let path = if self.path.is_empty() {
+            name.to_string()
+        } else {
+            format!("{}/{}", self.path, name)
+        };
+        SmbLocation {
+            share: self.share.clone(),
+            path,
+        }
+    }
+
+    /// The parent path inside the share. `None` at the share root itself; a
+    /// top-level entry's parent is the root, the empty path.
+    pub fn parent_path(&self) -> Option<String> {
+        if self.path.is_empty() {
+            return None;
+        }
+        Some(match self.path.rsplit_once('/') {
+            Some((parent, _)) => parent.to_string(),
+            None => String::new(),
+        })
+    }
+}
+
 /// Where an entry's bytes come from: the local filesystem or a share.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Source {
@@ -40,35 +68,7 @@ impl Source {
     pub fn join(&self, name: &str) -> Source {
         match self {
             Source::Local(path) => Source::Local(path.join(name)),
-            Source::Smb(loc) => {
-                let path = if loc.path.is_empty() {
-                    name.to_string()
-                } else {
-                    format!("{}/{}", loc.path, name)
-                };
-                Source::Smb(SmbLocation {
-                    share: loc.share.clone(),
-                    path,
-                })
-            }
-        }
-    }
-
-    /// The parent source, or `None` for a root: nothing above the filesystem
-    /// root, and nothing above a share's root (which acts as the root while
-    /// browsing the share).
-    pub fn parent(&self) -> Option<Source> {
-        match self {
-            Source::Local(path) => path.parent().map(|p| Source::Local(p.to_path_buf())),
-            Source::Smb(loc) => {
-                let trimmed = loc.path.rsplit_once('/').map(|(parent, _)| parent);
-                trimmed.map(|parent| {
-                    Source::Smb(SmbLocation {
-                        share: loc.share.clone(),
-                        path: parent.to_string(),
-                    })
-                })
-            }
+            Source::Smb(location) => Source::Smb(location.join(name)),
         }
     }
 
@@ -181,5 +181,50 @@ impl Sources for CombinedStore {
             Source::Local(_) => local::LocalStore::new().stat(source).await,
             Source::Smb(_) => self.shares.stat(source).await,
         }
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn location(path: &str) -> SmbLocation {
+        SmbLocation {
+            share: "nas".to_string(),
+            path: path.to_string(),
+        }
+    }
+
+    #[test]
+    fn join_names_the_child_below_the_current_path() {
+        assert_eq!(location("").join("game.nsp").path, "game.nsp");
+        assert_eq!(location("dir").join("game.nsp").path, "dir/game.nsp");
+    }
+
+    #[test]
+    fn join_keeps_the_share() {
+        assert_eq!(location("dir").join("game.nsp").share, "nas");
+    }
+
+    #[test]
+    fn parent_path_stops_at_the_share_root() {
+        assert_eq!(location("").parent_path(), None);
+    }
+
+    #[test]
+    fn parent_path_of_a_top_level_entry_is_the_root() {
+        assert_eq!(location("game.nsp").parent_path(), Some(String::new()));
+    }
+
+    #[test]
+    fn parent_path_of_a_nested_entry_is_its_directory() {
+        assert_eq!(
+            location("dir/game.nsp").parent_path(),
+            Some("dir".to_string())
+        );
+        assert_eq!(
+            location("dir/sub/game.nsp").parent_path(),
+            Some("dir/sub".to_string())
+        );
     }
 }
