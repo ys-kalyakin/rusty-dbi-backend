@@ -276,7 +276,7 @@ mod tests {
 
     /// An app whose records the form is about to extend.
     fn app_for_add(config_dir: Option<PathBuf>) -> (App, Arc<tokio::sync::Mutex<ShareHub>>) {
-        let mut app = App::new(FileList::new());
+        let mut app = App::with_shares(FileList::new(), Vec::new());
         app.config_hint = config_dir;
         let hub = Arc::new(tokio::sync::Mutex::new(ShareHub::new(
             Arc::new(NothingConnects),

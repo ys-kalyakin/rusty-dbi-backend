@@ -45,11 +45,11 @@
 
 ## 8. App: remove the dead state
 
-- [ ] 8.1 Delete `App::new` and its `allow(dead_code)` (`crates/app/src/app.rs:285-288`), and change the test module's call sites to `App::with_shares(files, Vec::new())`; verify the app's tests still pass and that `cargo clippy --all-targets -- -D warnings` finds no dead code
-- [ ] 8.2 Delete the `selection` field from `Action::Connect` (`crates/app/src/app.rs:52`) and the write that fills it, and rewrite the one test that asserted it to assert the share-list selection the app actually sets; verify the app's tests still pass
-- [ ] 8.3 Drop the return value of `App::share_added` (`crates/app/src/app.rs:935`) and delete its unreachable "defensive replace" branch (`:941-947`), which `config::build_share` already rules out; verify the app's tests still pass and that adding a share still replaces a same-named entry
-- [ ] 8.4 Delete `App::server_started` (`crates/app/src/app.rs:278`) and derive it from `status != ServerStatus::Idle` at the four read sites (`:691`, `:732`, `:1476` and the test at `:2711`); verify the app's tests still pass, in particular the one asserting the server task is active
-- [ ] 8.5 Make the `App::search` and `App::searching` fields private so the getters (`crates/app/src/app.rs:611-618`) are the only way to read them, and drop the `Clone` derive from `Action` and the `PartialEq` derives that nothing compares; verify the app's tests still pass and `cargo clippy --all-targets -- -D warnings` is clean
+- [x] 8.1 Delete `App::new` and its `allow(dead_code)` (pre-split `app.rs:285-288`), and change the test module's call sites to the `no_shares` helper calling `App::with_shares(files, Vec::new())`; verify the app's tests still pass and that `cargo clippy --all-targets -- -D warnings` finds no dead code
+- [x] 8.2 Delete the `selection` field from `Action::Connect` (`crates/app/src/app.rs:52`) and the write that fills it, and rewrite the one test that asserted it to assert the share-list selection the app actually sets; verify the app's tests still pass
+- [x] 8.3 Drop the return value of `App::share_added` (`crates/app/src/app.rs:935`) and delete its unreachable "defensive replace" branch (`:941-947`), which `config::build_share` already rules out; verify the app's tests still pass; adding a same-named entry needs no replacement because the form refuses a duplicate name
+- [x] 8.4 Delete `App::server_started` (`crates/app/src/app.rs:278`) and derive it from `status != ServerStatus::Idle` at the four read sites (`:691`, `:732`, `:1476` and the test at `:2711`); verify the app's tests still pass, in particular the one asserting the server task is active
+- [x] 8.5 Make the `App::search` and `App::searching` fields private so the getters (`crates/app/src/app.rs:611-618`) are the only way to read them, and drop the `Clone` derive from `Action` and the `PartialEq` derives that nothing compares; verify the app's tests still pass and `cargo clippy --all-targets -- -D warnings` is clean
 
 ## 9. App: one helper for each repeated piece of the UI
 

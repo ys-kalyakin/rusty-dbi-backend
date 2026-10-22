@@ -177,7 +177,7 @@ impl App {
 
         // While the server task is active (waiting or running), edits are inert so
         // the offered list matches the server's snapshot.
-        let running = self.server_started;
+        let running = self.status != ServerStatus::Idle;
         match key.code {
             KeyCode::Char('q') => {
                 self.mode = Mode::Confirm(ConfirmKind::Quit);
@@ -218,8 +218,7 @@ impl App {
                 Action::None
             }
             KeyCode::Char('s') => {
-                if !self.server_started && !self.files.is_empty() {
-                    self.server_started = true;
+                if self.status == ServerStatus::Idle && !self.files.is_empty() {
                     self.status = ServerStatus::Waiting;
                     Action::Start
                 } else {
@@ -237,7 +236,7 @@ impl App {
                 Action::None
             }
             KeyCode::Esc => {
-                if !self.search.is_empty() {
+                if !self.search().is_empty() {
                     self.clear_search();
                 }
                 Action::None
@@ -390,11 +389,7 @@ impl App {
                 self.mode = Mode::Shares(ShareList {
                     selected: selection,
                 });
-                Action::Connect {
-                    share,
-                    password,
-                    selection,
-                }
+                Action::Connect { share, password }
             }
             KeyCode::Esc => {
                 let share = modal.share.clone();

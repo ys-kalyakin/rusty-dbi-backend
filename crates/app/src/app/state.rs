@@ -30,7 +30,7 @@ pub enum ServerStatus {
 }
 
 /// What the caller should do after a key press.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Action {
     None,
     Start,
@@ -40,7 +40,6 @@ pub enum Action {
     Connect {
         share: String,
         password: String,
-        selection: usize,
     },
     /// List a share directory through the store (the picker asked for it).
     List(Source),
@@ -54,7 +53,7 @@ pub enum Action {
 }
 
 /// A lifecycle or progress transition reported by the background server task.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub enum ServerEvent {
     Started,
     Disconnected,
@@ -228,14 +227,14 @@ impl PasswordModal {
 }
 
 /// A retained log line with its age relative to application start.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone)]
 pub struct LogLine {
     pub at: Duration,
     pub message: String,
 }
 
 /// The latest transfer progress, with derived speed once two samples are seen.
-#[derive(Debug, Clone, PartialEq)]
+#[derive(Debug, Clone)]
 pub struct ProgressState {
     pub name: String,
     pub sent: u64,
@@ -259,25 +258,17 @@ pub struct App {
     pub progress: Option<ProgressState>,
     /// The search narrowing the visible file list. It never changes the files
     /// offered to the Switch.
-    pub search: String,
+    search: String,
     /// Whether the search input is open.
-    pub searching: bool,
+    searching: bool,
     /// Configured shares for the share list, sorted by display name.
     pub shares: Vec<ShareConfig>,
     /// Where the config file lives, for the empty-share-list hint.
     pub config_hint: Option<PathBuf>,
-    pub(crate) server_started: bool,
     pub(crate) started_at: Instant,
 }
 
 impl App {
-    /// The plain constructor: no shares configured. Also the test harness's
-    /// default, hence the dead-code allowance for the server-only binary.
-    #[cfg_attr(not(test), allow(dead_code))]
-    pub fn new(files: FileList) -> Self {
-        Self::with_shares(files, Vec::new())
-    }
-
     /// An app that knows the configured shares for the share list view.
     pub fn with_shares(files: FileList, mut shares: Vec<ShareConfig>) -> Self {
         shares.sort_by(|a, b| a.name.cmp(&b.name));
@@ -293,7 +284,6 @@ impl App {
             searching: false,
             shares,
             config_hint: config::config_path(),
-            server_started: false,
             started_at: Instant::now(),
         }
     }
@@ -320,7 +310,6 @@ impl App {
             }
             ServerEvent::Ended => {
                 self.status = ServerStatus::Idle;
-                self.server_started = false;
                 self.progress = None;
             }
             ServerEvent::Progress { name, sent, total } => {
@@ -516,26 +505,18 @@ impl App {
         self.shares.iter().find(|config| config.name == name)
     }
 
-    /// Register a share the add form built: inserted among the sorted shares
-    /// (replacing a same-named entry defensively, as the hub does), with the
-    /// share list brought back up and the highlight on the added share.
-    /// Returns that share's position in the list.
-    pub fn share_added(&mut self, config: ShareConfig) -> usize {
+    /// Register a share the add form built: inserted among the sorted shares,
+    /// with the share list brought back up and the highlight on the added
+    /// share. The form refuses a duplicate name, so there is nothing to
+    /// replace here.
+    pub fn share_added(&mut self, config: ShareConfig) {
         let position = self
             .shares
             .iter()
             .position(|other| other.name >= config.name)
             .unwrap_or(self.shares.len());
-        if self
-            .shares
-            .get(position)
-            .is_some_and(|s| s.name == config.name)
-        {
-            self.shares.remove(position);
-        }
         self.shares.insert(position, config);
         self.mode = Mode::Shares(ShareList { selected: position });
-        position
     }
 
     /// The app's answer to a failed share connection: stay on the share list

@@ -30,6 +30,11 @@ use std::path::Path;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
+/// An app with no shares configured.
+fn no_shares(files: FileList) -> App {
+    App::with_shares(files, Vec::new())
+}
+
 fn press(c: char) -> KeyEvent {
     KeyEvent::new(KeyCode::Char(c), KeyModifiers::NONE)
 }
@@ -39,7 +44,7 @@ fn key(code: KeyCode) -> KeyEvent {
 }
 
 fn app_with_picker(dir: &Path) -> App {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.mode = Mode::Picker(Picker::at(dir));
     app
 }
@@ -71,7 +76,7 @@ fn row_text(buffer: &ratatui::buffer::Buffer, y: u16) -> String {
 
 #[test]
 fn push_log_caps_at_max_lines() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     for i in 0..(MAX_LOG_LINES + 50) {
         app.push_log(i.to_string());
     }
@@ -80,7 +85,7 @@ fn push_log_caps_at_max_lines() {
 
 #[test]
 fn q_opens_confirmation_and_y_quits() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     assert_eq!(app.handle_key(press('q')), Action::None);
     assert!(matches!(app.mode, Mode::Confirm(ConfirmKind::Quit)));
     assert!(!app.should_quit);
@@ -90,7 +95,7 @@ fn q_opens_confirmation_and_y_quits() {
 
 #[test]
 fn q_confirmation_can_be_cancelled() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.handle_key(press('q'));
     assert_eq!(app.handle_key(press('n')), Action::None);
     assert!(matches!(app.mode, Mode::Normal));
@@ -99,7 +104,7 @@ fn q_confirmation_can_be_cancelled() {
 
 #[test]
 fn c_requires_confirmation() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files.insert("a.nsp", "/tmp/a.nsp");
     assert_eq!(app.handle_key(press('c')), Action::None);
     assert!(matches!(app.mode, Mode::Confirm(ConfirmKind::Clear)));
@@ -111,7 +116,7 @@ fn c_requires_confirmation() {
 
 #[test]
 fn c_confirmation_can_be_cancelled() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files.insert("a.nsp", "/tmp/a.nsp");
     app.handle_key(press('c'));
     app.handle_key(press('x'));
@@ -121,7 +126,7 @@ fn c_confirmation_can_be_cancelled() {
 
 /// An app offering the given file names, all with a size.
 fn app_with_files(names: &[&str]) -> App {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     for name in names {
         app.files.insert(*name, format!("/tmp/{name}"));
     }
@@ -237,7 +242,7 @@ fn the_search_works_while_the_server_runs() {
 
 #[test]
 fn the_add_log_line_names_the_accepted_and_rejected_counts() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     let outcome = AddOutcome {
         added: vec!["a.nsp".into(), "b.nsp".into()],
         rejected: 5,
@@ -259,7 +264,7 @@ fn the_add_log_line_names_the_accepted_and_rejected_counts() {
 
 #[test]
 fn a_scan_that_rejects_everything_says_so() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     let outcome = AddOutcome {
         rejected: 3,
         ..AddOutcome::default()
@@ -349,7 +354,7 @@ async fn the_switch_receives_the_whole_offered_list_while_a_search_narrows_the_v
     assert_eq!(outcome.added.len(), 2, "the scan accepted two files");
     assert_eq!(outcome.rejected, 2, "the filters rejected two files");
 
-    let mut app = App::new(files);
+    let mut app = no_shares(files);
     type_search(&mut app, "a");
     assert_eq!(visible_names(&app), vec!["a.nsp"], "the view is narrowed");
     assert_eq!(
@@ -385,7 +390,7 @@ async fn the_switch_receives_the_whole_offered_list_while_a_search_narrows_the_v
 
 #[test]
 fn help_overlay_toggles_with_question_mark() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     assert_eq!(app.handle_key(press('?')), Action::None);
     assert!(matches!(app.mode, Mode::Help));
     app.handle_key(press('?'));
@@ -394,7 +399,7 @@ fn help_overlay_toggles_with_question_mark() {
 
 #[test]
 fn s_starts_only_when_files_present_and_only_once() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     assert_eq!(app.handle_key(press('s')), Action::None);
 
     app.files.insert("a", "/tmp/a");
@@ -404,7 +409,7 @@ fn s_starts_only_when_files_present_and_only_once() {
 
 #[test]
 fn s_sets_waiting_until_the_device_connects() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files.insert("a", "/tmp/a");
 
     assert_eq!(app.handle_key(press('s')), Action::Start);
@@ -413,7 +418,7 @@ fn s_sets_waiting_until_the_device_connects() {
 
 #[test]
 fn started_makes_running_and_disconnected_returns_to_waiting() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files.insert("a", "/tmp/a");
     app.handle_key(press('s'));
 
@@ -426,7 +431,7 @@ fn started_makes_running_and_disconnected_returns_to_waiting() {
 
 #[test]
 fn progress_does_not_survive_disconnect_and_reconnect() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.handle_server_event(ServerEvent::Started);
     app.handle_server_event(ServerEvent::Progress {
         name: "game.nsp".into(),
@@ -445,7 +450,7 @@ fn progress_does_not_survive_disconnect_and_reconnect() {
 
 #[test]
 fn edits_stay_inert_while_waiting() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files.insert("a", "/tmp/a");
     app.handle_key(press('s'));
     assert_eq!(app.status, ServerStatus::Waiting);
@@ -460,7 +465,7 @@ fn edits_stay_inert_while_waiting() {
 
 #[test]
 fn ended_event_returns_to_idle_and_allows_restart() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files.insert("a", "/tmp/a");
 
     assert_eq!(app.handle_key(press('s')), Action::Start);
@@ -477,7 +482,7 @@ fn ended_event_returns_to_idle_and_allows_restart() {
 
 #[test]
 fn edits_are_inert_while_the_server_runs() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files.insert("keep", "/tmp/keep");
     assert_eq!(app.handle_key(press('s')), Action::Start);
     assert!(matches!(app.status, ServerStatus::Waiting));
@@ -499,7 +504,7 @@ fn edits_are_inert_while_the_server_runs() {
 
 #[test]
 fn log_shows_the_newest_lines() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     for i in 0..10 {
         app.push_log(format!("line-{i}"));
     }
@@ -511,7 +516,7 @@ fn log_shows_the_newest_lines() {
 
 #[test]
 fn a_opens_the_picker() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     assert_eq!(app.handle_key(press('a')), Action::None);
     assert!(matches!(app.mode, Mode::Picker(_)));
 }
@@ -657,7 +662,7 @@ fn cancel_restores_the_normal_help_line() {
 
 #[test]
 fn selection_moves_and_clamps() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files.insert("a.nsp", "/tmp/a.nsp");
     app.files.insert("b.nsp", "/tmp/b.nsp");
 
@@ -670,7 +675,7 @@ fn selection_moves_and_clamps() {
 
 #[test]
 fn file_list_scrolls_to_the_highlight() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     for i in 0..40 {
         app.files
             .insert(format!("f{i:02}.nsp"), format!("/tmp/f{i:02}.nsp"));
@@ -687,7 +692,7 @@ fn file_list_scrolls_to_the_highlight() {
 
 #[test]
 fn d_removes_the_highlighted_file() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files.insert("a.nsp", "/tmp/a.nsp");
     app.files.insert("b.nsp", "/tmp/b.nsp");
 
@@ -701,7 +706,7 @@ fn d_removes_the_highlighted_file() {
 
 #[test]
 fn removal_is_inert_while_the_server_runs() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files.insert("a.nsp", "/tmp/a.nsp");
     assert_eq!(app.handle_key(press('s')), Action::Start);
     app.handle_key(press('d'));
@@ -723,7 +728,7 @@ async fn the_flow_reads_the_identities_and_keeps_the_offer_unchanged() {
     assert_eq!(outcome.added.len(), 2, "two titles were accepted");
     assert_eq!(outcome.rejected, 1, "the notes file was rejected");
 
-    let app = App::new(files);
+    let app = no_shares(files);
     let base = app
         .files
         .get("Game [0100000000010000][v65536].nsp")
@@ -770,7 +775,7 @@ async fn the_flow_reads_the_identities_and_keeps_the_offer_unchanged() {
 async fn the_file_list_shows_the_title_identity() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("Game [0100000000010000][v65536].nsp"), b"x").unwrap();
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files
         .add_path(dir.path(), &LocalStore::new())
         .await
@@ -784,7 +789,7 @@ async fn the_file_list_shows_the_title_identity() {
 
 #[test]
 fn a_file_without_an_identity_shows_only_its_name() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files.insert("plain.nsp", "/tmp/plain.nsp");
 
     let view = render(&app, 120, 12);
@@ -797,7 +802,7 @@ fn a_file_without_an_identity_shows_only_its_name() {
 async fn a_narrow_terminal_drops_the_identity_but_keeps_the_name() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("Game [0100000000010000][v65536].nsp"), b"x").unwrap();
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files
         .add_path(dir.path(), &LocalStore::new())
         .await
@@ -812,7 +817,7 @@ async fn a_narrow_terminal_drops_the_identity_but_keeps_the_name() {
 async fn files_list_shows_sizes_and_total() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.nsp"), vec![0u8; 2048]).unwrap();
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files
         .add_path(dir.path(), &LocalStore::new())
         .await
@@ -825,13 +830,13 @@ async fn files_list_shows_sizes_and_total() {
 
 #[test]
 fn empty_file_list_shows_an_onboarding_hint() {
-    let empty = App::new(FileList::new());
+    let empty = no_shares(FileList::new());
     let view = render(&empty, 60, 12);
     assert!(view.contains("No files yet"));
     assert!(view.contains("press `a` to add"));
     assert!(view.contains("No files yet — press `a` to add"));
 
-    let mut populated = App::new(FileList::new());
+    let mut populated = no_shares(FileList::new());
     populated.files.insert("a.nsp", "/tmp/a.nsp");
     let view = render(&populated, 60, 12);
     assert!(!view.contains("No files yet"));
@@ -842,7 +847,7 @@ async fn size_column_is_right_aligned_in_the_files_table() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.nsp"), vec![0u8; 1024]).unwrap();
     fs::write(dir.path().join("verylonggamename.nsp"), vec![0u8; 2048]).unwrap();
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files
         .add_path(dir.path(), &LocalStore::new())
         .await
@@ -861,13 +866,13 @@ async fn size_column_is_right_aligned_in_the_files_table() {
 
 #[test]
 fn header_identifies_the_app_and_shows_counts() {
-    let app = App::new(FileList::new());
+    let app = no_shares(FileList::new());
     let view = render(&app, 80, 12);
     assert!(view.contains(theme::APP_NAME));
     assert!(view.contains("idle"));
     assert!(view.contains("0 files · total: 0 B"));
 
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files.insert("a.nsp", "/tmp/a.nsp");
     app.files.insert("b.nsp", "/tmp/b.nsp");
     let view = render(&app, 80, 12);
@@ -876,7 +881,7 @@ fn header_identifies_the_app_and_shows_counts() {
 
 #[test]
 fn hint_chips_dim_locked_keys_while_the_server_is_active() {
-    let idle = App::new(FileList::new());
+    let idle = no_shares(FileList::new());
     let bottom = |app: &App| {
         let buf = buffer(app, 60, 12);
         let y = buf.area.height - 1;
@@ -895,10 +900,10 @@ fn hint_chips_dim_locked_keys_while_the_server_is_active() {
         "no muted cells when idle"
     );
 
-    let mut active = App::new(FileList::new());
+    let mut active = no_shares(FileList::new());
     active.files.insert("a", "/tmp/a");
     active.handle_key(press('s'));
-    assert!(active.server_started);
+    assert!(active.status != ServerStatus::Idle);
     let active_fgs = bottom(&active);
     assert!(
         active_fgs.iter().filter(|c| **c == theme::MUTED).count() >= 12,
@@ -912,13 +917,13 @@ fn hint_chips_dim_locked_keys_while_the_server_is_active() {
 
 #[test]
 fn status_header_is_colored_by_state() {
-    let app = App::new(FileList::new());
+    let app = no_shares(FileList::new());
     // x=13 is the status capsule: "dbi-backend" (11 chars) + two spaces.
     assert_eq!(buffer(&app, 80, 12).cell((13, 0)).unwrap().fg, Color::Gray);
     let view = render(&app, 80, 12);
     assert!(view.contains("idle"));
 
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files.insert("a", "/tmp/a");
     app.handle_key(press('s'));
     assert_eq!(app.status, ServerStatus::Waiting);
@@ -939,7 +944,7 @@ fn status_header_is_colored_by_state() {
 
 #[test]
 fn log_lines_are_timestamped_and_warnings_are_colored() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.push_log("Warning: bad thing".into());
 
     let view = render(&app, 60, 12);
@@ -958,7 +963,7 @@ fn remaining_seconds_divides_remainder_by_speed() {
 
 #[test]
 fn progress_eta_comes_from_the_second_sample() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     let start = Instant::now();
     app.handle_server_event(ServerEvent::Started);
     app.update_progress_at("a.nsp".into(), 50, 100, start);
@@ -974,7 +979,7 @@ fn progress_eta_comes_from_the_second_sample() {
 
 #[test]
 fn progress_speed_is_smoothed_across_uneven_samples() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     let start = Instant::now();
     app.handle_server_event(ServerEvent::Started);
 
@@ -1013,7 +1018,7 @@ fn progress_speed_is_smoothed_across_uneven_samples() {
 
 #[test]
 fn sub_100ms_samples_do_not_recompute_the_speed() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     let start = Instant::now();
     app.handle_server_event(ServerEvent::Started);
 
@@ -1039,7 +1044,7 @@ fn sub_100ms_samples_do_not_recompute_the_speed() {
 
 #[test]
 fn progress_eta_is_carried_when_no_bytes_advance() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     let start = Instant::now();
     app.handle_server_event(ServerEvent::Started);
 
@@ -1067,7 +1072,7 @@ fn progress_eta_is_carried_when_no_bytes_advance() {
 
 #[test]
 fn progress_eta_is_zero_when_complete() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     let start = Instant::now();
     app.handle_server_event(ServerEvent::Started);
 
@@ -1110,7 +1115,7 @@ fn progress_eta_is_zero_when_complete() {
 
 #[test]
 fn progress_backward_sample_restarts_the_phase() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     let start = Instant::now();
     app.handle_server_event(ServerEvent::Started);
 
@@ -1223,7 +1228,7 @@ async fn preparation_reads_and_restart_never_flash_a_full_bar_before_install() {
     ]
     .concat();
 
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.handle_server_event(ServerEvent::Started);
 
     let mut install_phase = false;
@@ -1273,7 +1278,7 @@ async fn preparation_reads_and_restart_never_flash_a_full_bar_before_install() {
 
 #[test]
 fn progress_eta_resets_for_a_new_file() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     let start = Instant::now();
     app.handle_server_event(ServerEvent::Started);
     app.update_progress_at("a.nsp".into(), 90, 100, start);
@@ -1289,7 +1294,7 @@ fn progress_eta_resets_for_a_new_file() {
 
 #[test]
 fn progress_event_updates_and_clears() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     let start = Instant::now();
     app.handle_server_event(ServerEvent::Started);
     app.update_progress_at("game.nsp".into(), 50, 100, start);
@@ -1314,7 +1319,7 @@ fn progress_event_updates_and_clears() {
 
 #[test]
 fn progress_renders_the_name_and_the_bar_on_one_row() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     let start = Instant::now();
     app.handle_server_event(ServerEvent::Started);
     app.update_progress_at("game.nsp".into(), 100, 100, start);
@@ -1340,7 +1345,7 @@ fn progress_renders_the_name_and_the_bar_on_one_row() {
 
 #[test]
 fn progress_keeps_the_file_name_at_the_start_of_a_narrow_row() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     let start = Instant::now();
     app.handle_server_event(ServerEvent::Started);
     app.update_progress_at("game.nsp".into(), 50, 100, start);
@@ -1362,7 +1367,7 @@ fn progress_keeps_the_file_name_at_the_start_of_a_narrow_row() {
 
 #[test]
 fn progress_bar_fills_from_reported_bytes() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     let start = Instant::now();
     app.handle_server_event(ServerEvent::Started);
     app.update_progress_at("game.nsp".into(), 50, 100, start);
@@ -1405,7 +1410,7 @@ fn progress_bar_fills_from_reported_bytes() {
 
 #[test]
 fn completed_transfer_logs_a_summary_and_clears_the_progress() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.handle_server_event(ServerEvent::Started);
     app.handle_server_event(ServerEvent::Progress {
         name: "game.nsp".into(),
@@ -1431,7 +1436,7 @@ fn completed_transfer_logs_a_summary_and_clears_the_progress() {
 
 #[test]
 fn progress_persists_between_ranges_until_a_file_completes() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.handle_server_event(ServerEvent::Started);
     app.update_progress_at("game.nsp".into(), 50, 100, Instant::now());
     assert!(render(&app, 120, 12).contains("Sending game.nsp"));
@@ -1458,7 +1463,7 @@ fn progress_persists_between_ranges_until_a_file_completes() {
 
 #[test]
 fn sending_lines_take_the_informational_log_color() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.push_log("Sending: game.nsp".into());
 
     assert_eq!(log_color("Sending: game.nsp"), theme::SUBTLE);
@@ -1480,7 +1485,7 @@ fn sending_lines_take_the_informational_log_color() {
 
 #[test]
 fn sent_lines_are_colored_as_success() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.handle_server_event(ServerEvent::Completed {
         name: "game.nsp".into(),
         bytes: 4096,
@@ -1603,7 +1608,7 @@ async fn narrow_terminal_truncates_long_paths() {
     let dir = tempfile::tempdir().unwrap();
     let long_name = "a-nsp-file-with-a-remarkably-long-name.nsp";
     fs::write(dir.path().join(long_name), vec![0u8; 2048]).unwrap();
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files
         .add_path(dir.path(), &LocalStore::new())
         .await
@@ -1619,7 +1624,7 @@ fn picker_rows_show_file_sizes_but_not_directory_sizes() {
     fs::write(dir.path().join("a.nsp"), vec![0u8; 1024]).unwrap();
     fs::write(dir.path().join("verybig.nsp"), vec![0u8; 2048]).unwrap();
     fs::create_dir(dir.path().join("games")).unwrap();
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.mode = Mode::Picker(Picker::at(dir.path()));
 
     let buf = buffer(&app, 80, 16);
@@ -1649,7 +1654,7 @@ fn picker_title_shows_the_entry_count() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("a.nsp"), b"a").unwrap();
     fs::write(dir.path().join("b.nsp"), b"b").unwrap();
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.mode = Mode::Picker(Picker::at(dir.path()));
 
     let view = render(&app, 80, 12);
@@ -1661,7 +1666,7 @@ fn picker_title_shows_the_match_count_while_filtering() {
     let dir = tempfile::tempdir().unwrap();
     fs::write(dir.path().join("alpha.nsp"), b"a").unwrap();
     fs::write(dir.path().join("beta.nsp"), b"b").unwrap();
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.mode = Mode::Picker(Picker::at(dir.path()));
     app.handle_key(press('/'));
     app.handle_key(press('b'));
@@ -1694,7 +1699,7 @@ fn confirm_dialog_is_compact_for_both_prompts() {
         (ConfirmKind::Quit, "Quit dbi-backend? [y/N]"),
         (ConfirmKind::Clear, "Clear the file list? [y/N]"),
     ] {
-        let mut app = App::new(FileList::new());
+        let mut app = no_shares(FileList::new());
         app.mode = Mode::Confirm(kind);
         let buf = buffer(&app, 80, 24);
 
@@ -1855,7 +1860,7 @@ fn share_list_rows_show_the_details_sorted_by_name() {
 
 #[test]
 fn empty_share_list_names_the_add_key_and_the_config_path() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.mode = Mode::Shares(ShareList::open());
     let view = render(&app, 120, 14);
     assert!(view.contains("No shares configured"));
@@ -1881,7 +1886,7 @@ fn the_share_list_shows_its_own_hints_including_add() {
 
 #[test]
 fn the_help_overlay_mentions_the_share_list_keys() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.mode = Mode::Help;
     let view = render(&app, 80, 24);
     assert!(
@@ -1936,14 +1941,9 @@ fn enter_submits_and_the_buffer_leaves_with_it() {
     }
     let action = app.handle_key(key(KeyCode::Enter));
     match action {
-        Action::Connect {
-            share,
-            password,
-            selection,
-        } => {
+        Action::Connect { share, password } => {
             assert_eq!(share, "Games");
             assert_eq!(password, "secret");
-            assert_eq!(selection, 1, "Games is the second sorted share");
         }
         other => panic!("expected a connect action, got {other:?}"),
     }
@@ -2156,7 +2156,7 @@ fn space_on_a_share_entry_starts_an_add_and_closes_the_picker() {
 
 #[test]
 fn share_origins_show_in_the_files_table_share_qualified() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.files
         .insert_source("game.nsp", Source::Smb(loc("switch/game.nsp")), 42);
     let view = render(&app, 120, 12);
@@ -2168,7 +2168,7 @@ fn share_origins_show_in_the_files_table_share_qualified() {
 
 #[test]
 fn the_help_overlay_lists_s() {
-    let mut app = App::new(FileList::new());
+    let mut app = no_shares(FileList::new());
     app.mode = Mode::Help;
     let view = render(&app, 80, 24);
     assert!(view.contains("S   list configured shares"));

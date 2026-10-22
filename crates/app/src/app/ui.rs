@@ -360,12 +360,12 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
         Mode::Password(_) => Line::from(Span::styled("Enter connect · Esc cancel", theme::muted())),
         Mode::Shares(_) => Line::from(Span::styled(SHARES_HINT, theme::fg(theme::WARNING))),
         Mode::ShareForm(_) => Line::from(Span::styled(SHARE_FORM_HINT, theme::fg(theme::WARNING))),
-        Mode::Normal if app.searching => Line::from(vec![
+        Mode::Normal if app.is_searching() => Line::from(vec![
             Span::styled(format!("search: {}", app.search()), theme::accent()),
             Span::raw("  "),
             Span::styled(SEARCH_HINT, theme::muted()),
         ]),
-        _ => normal_hint_line(app.server_started),
+        _ => normal_hint_line(app.status != ServerStatus::Idle),
     };
     frame.render_widget(Paragraph::new(line), area);
 }
