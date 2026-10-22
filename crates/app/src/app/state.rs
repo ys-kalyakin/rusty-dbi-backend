@@ -268,6 +268,20 @@ pub struct App {
     pub(crate) started_at: Instant,
 }
 
+/// One step of a clamped cursor over a list of `len` rows: clamped into
+/// range first, then moved by `delta` with both ends saturating. `None`
+/// leaves the cursor to an empty list, whose cursor is the caller's to
+/// define.
+pub(crate) fn clamped_step(cursor: usize, len: usize, delta: isize) -> Option<usize> {
+    let max = len.checked_sub(1)?;
+    let current = cursor.min(max);
+    Some(if delta < 0 {
+        current.saturating_sub(delta.unsigned_abs())
+    } else {
+        (current + delta as usize).min(max)
+    })
+}
+
 impl App {
     /// An app that knows the configured shares for the share list view.
     pub fn with_shares(files: FileList, mut shares: Vec<ShareConfig>) -> Self {
@@ -415,18 +429,7 @@ impl App {
     }
 
     pub(crate) fn move_selection(&mut self, delta: isize) {
-        let len = self.visible_files().len();
-        if len == 0 {
-            self.selected = 0;
-            return;
-        }
-        let max = len - 1;
-        let current = self.selected.min(max);
-        self.selected = if delta < 0 {
-            current.saturating_sub(delta.unsigned_abs())
-        } else {
-            (current + delta as usize).min(max)
-        };
+        self.selected = clamped_step(self.selected, self.visible_files().len(), delta).unwrap_or(0);
     }
 
     pub(crate) fn clamp_selection(&mut self) {

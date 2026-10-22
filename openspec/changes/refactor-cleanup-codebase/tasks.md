@@ -59,8 +59,8 @@
 
 ## 10. App: one way to handle the repeated key cases
 
-- [ ] 10.1 Replace the two copies of the printable-character guard (`crates/app/src/app.rs:835` and `:883`) with one helper, keeping the accepted set identical — every character that is not a control character, exactly as today; verify the share-form and password-modal tests still accept the same characters
-- [ ] 10.2 Replace the four copies of the `j`/`k` and arrow-key movement arms with one clamped-movement helper for the file list, the search input and the share list (`crates/app/src/app.rs:487-493`, `:723-729`, `:783-790` and `:804-811`); verify the cursor tests for the file list, the share list and the picker still pass, in particular the "stops at the last row" and "clamped at the top" cases
+- [x] 10.1 Replace the two copies of the printable-character guard (`crates/app/src/app.rs:835` and `:883`) with one helper, keeping the accepted set identical — every character that is not a control character, exactly as today; verify the share-form and password-modal tests still accept the same characters
+- [x] 10.2 Replace the four copies of the `j`/`k` and arrow-key movement arms with one clamped-movement helper for the file list, the search input and the share list (`crates/app/src/app.rs:487-493`, `:723-729`, `:783-790` and `:804-811`); verify the cursor tests for the file list, the share list and the picker still pass, in particular the "stops at the last row" and "clamped at the top" cases
 
 ## 11. App: validate a share in one place
 

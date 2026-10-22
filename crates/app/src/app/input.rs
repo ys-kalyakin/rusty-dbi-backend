@@ -5,9 +5,18 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use dbi_backend_core::source::Source;
 
 use super::state::{
-    Action, App, ConfirmKind, Mode, PasswordModal, ServerStatus, ShareFormState, ShareList,
+    clamped_step, Action, App, ConfirmKind, Mode, PasswordModal, ServerStatus, ShareFormState,
+    ShareList,
 };
 use crate::picker::{Kind, Picker};
+
+/// The character a typed value accepts: any character that is not a control
+/// character. Today's keys send characters in that set and nothing else; the
+/// written-out `is_ascii_graphic()` and space clauses never changed its
+/// result, because every control character is neither graphic nor a space.
+fn printable(c: char) -> bool {
+    !c.is_control()
+}
 
 impl App {
     /// Picker keys. A selection comes back as an async action for the caller
@@ -290,12 +299,12 @@ impl App {
         };
         match key.code {
             KeyCode::Char('j') | KeyCode::Down => {
-                if !self.shares.is_empty() {
-                    list.selected = (list.selected + 1).min(self.shares.len() - 1);
-                }
+                list.selected =
+                    clamped_step(list.selected, self.shares.len(), 1).unwrap_or(list.selected);
             }
             KeyCode::Char('k') | KeyCode::Up => {
-                list.selected = list.selected.saturating_sub(1);
+                list.selected =
+                    clamped_step(list.selected, self.shares.len(), -1).unwrap_or(list.selected);
             }
             KeyCode::Enter => {
                 if let Some(share) = self.shares.get(list.selected).map(|s| s.name.clone()) {
@@ -320,7 +329,7 @@ impl App {
             return Action::None;
         };
         match key.code {
-            KeyCode::Char(c) if c.is_ascii_graphic() || c == ' ' || !c.is_control() => {
+            KeyCode::Char(c) if printable(c) => {
                 form.push(c);
             }
             KeyCode::Backspace => {
@@ -368,7 +377,7 @@ impl App {
             return Action::None;
         };
         match key.code {
-            KeyCode::Char(c) if c.is_ascii_graphic() || c == ' ' || !c.is_control() => {
+            KeyCode::Char(c) if printable(c) => {
                 modal.push(c);
                 Action::None
             }
