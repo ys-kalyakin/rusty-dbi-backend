@@ -75,9 +75,9 @@
 
 ## 13. Final verification
 
-- [ ] 13.1 Run the project's checks — `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` — and confirm all three are clean; verify by running each command and reading its output
-- [ ] 13.2 Confirm the observable behaviour is unchanged: the same files are offered to the Switch for the same inputs, the same bytes are streamed for the same range requests, the same keys do the same things, the same messages are logged and the same configuration is read. Verify by running the whole test suite with no test changed or skipped except the three call sites named in task 4.1, 8.1 and 8.2, and by diffing the logged messages and the rendered rows against the pre-change behaviour
-- [ ] 13.3 Confirm nothing user-facing moved: the command line, the config file format, the DBI0 wire protocol and the README's documented keys and options are unchanged. Verify by reading `crates/app/src/cli.rs`, `crates/app/src/config.rs` and `crates/core/src/protocol.rs` against their pre-change contents, and by checking that `README.md` needs no edit
+- [x] 13.1 Run the project's checks — `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings`, `cargo fmt --check` — and confirm all three are clean; verify by running each command and reading its output
+- [x] 13.2 Confirm the observable behaviour is unchanged: the same files are offered to the Switch for the same inputs, the same bytes are streamed for the same range requests, the same keys do the same things, the same messages are logged and the same configuration is read. Verify by running the whole test suite with no test changed or skipped except the three call sites named in task 4.1, 8.1 and 8.2, and by diffing the logged messages and the rendered rows against the pre-change behaviour
+- [x] 13.3 Confirm nothing user-facing moved: the command line, the config file format, the DBI0 wire protocol and the README's documented keys and options are unchanged. Verify by reading `crates/app/src/cli.rs`, `crates/app/src/config.rs` and `crates/core/src/protocol.rs` against their pre-change contents, and by checking that `README.md` needs no edit
 
 ## Workflow follow-up
 
