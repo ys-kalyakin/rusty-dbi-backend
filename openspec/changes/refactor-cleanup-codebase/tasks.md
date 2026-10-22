@@ -39,9 +39,9 @@
 
 ## 7. App: split the application module
 
-- [ ] 7.1 Turn `crates/app/src/app.rs` into the directory `crates/app/src/app/` with `mod.rs`, `state.rs`, `input.rs`, `ui.rs`, `server.rs`, `format.rs` and `tests.rs`, moving the code as it stands; verify `cargo build`, `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` are all green and that `git diff -M` shows the move as renames
-- [ ] 7.2 Make `App::started_at` and the fields the key handlers read visible to the sibling modules (`pub(crate)`), and keep `App`'s remaining private surface inside `state.rs`; verify the compiler accepts the split and `cargo clippy --all-targets -- -D warnings` is clean
-- [ ] 7.3 Re-export `App`, `Action`, `ServerEvent`, `ui` and `spawn_server` from `crates/app/src/app/mod.rs` so `crates/app/src/main.rs` needs no change; verify `cargo build` succeeds and `crates/app/src/main.rs` is unchanged by the split
+- [x] 7.1 Turn `crates/app/src/app.rs` into the directory `crates/app/src/app/` with `mod.rs`, `state.rs`, `input.rs`, `ui.rs`, `server.rs`, `format.rs` and `tests.rs`, moving the code as it stands; verify `cargo build`, `cargo test --workspace`, `cargo clippy --all-targets -- -D warnings` and `cargo fmt --check` are all green and that every line of the original file is accounted for in the new modules — a one-to-seven split is reported by git as a delete and seven adds, not as renames
+- [x] 7.2 Make `App::started_at`, `App::server_started`, the methods the key handlers and the tests share (`move_selection`, `clamp_selection`, `remove_selected`, `update_progress_at`), the share form's field constants and the formatting and layout helpers visible to the sibling modules (`pub(crate)`); verify the compiler accepts the split and `cargo clippy --all-targets -- -D warnings` is clean
+- [x] 7.3 Re-export `App`, `Action`, `ServerEvent`, `ui` and `spawn_server` from `crates/app/src/app/mod.rs` so `crates/app/src/main.rs` needs no change; verify `cargo build` succeeds and `crates/app/src/main.rs` is unchanged by the split
 
 ## 8. App: remove the dead state
 
