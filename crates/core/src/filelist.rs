@@ -332,8 +332,9 @@ impl FileList {
         self.files.get(name)
     }
 
-    pub fn names(&self) -> impl Iterator<Item = &String> {
-        self.files.keys()
+    /// The entries' names, in the order the list holds them.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(String::as_str)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&String, &FileEntry)> {

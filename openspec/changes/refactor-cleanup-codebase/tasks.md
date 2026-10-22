@@ -32,10 +32,10 @@
 
 ## 6. Core: split the file-range handler and drop its excess copies
 
-- [ ] 6.1 Split `Server::process_file_range` (`crates/core/src/server.rs:129-263`) into named steps for the acknowledgement, the range-header parse, the stream-state decision, the streaming loop and the completion; verify `crates/core/tests/server_test.rs` still passes in full, in particular the six-range preparation sequence, the throttled-progress case and the re-announce case
-- [ ] 6.2 Stop cloning the `FileEntry` and then its `Source` again (`crates/core/src/server.rs:153` and `:157`): borrow the entry, clone the `Source` once and copy the size out; verify the server integration tests still pass
-- [ ] 6.3 Reuse one buffer on the `Server` instead of allocating and zeroing up to 1 MiB per `FILE_RANGE` request (`crates/core/src/server.rs:207`); verify the multi-chunk streaming test and the short-transfer test still pass and that only the bytes the read produced are written to the transport
-- [ ] 6.4 Change `build_list` (`crates/core/src/protocol.rs:105-113`) to take borrowed names and `FileList::names` (`crates/core/src/filelist.rs:338-340`) to yield `&str`, so the list command no longer materialises a `Vec<String>` of every name; verify the "list command sends file names then exits" test still passes with the same payload
+- [x] 6.1 Split `Server::process_file_range` (`crates/core/src/server.rs:129-263`) into named steps for the acknowledgement, the range-header parse, the stream-state decision, the streaming loop and the completion; verify `crates/core/tests/server_test.rs` still passes in full, in particular the six-range preparation sequence, the throttled-progress case and the re-announce case
+- [x] 6.2 Stop cloning the `FileEntry` and then its `Source` again (`crates/core/src/server.rs:153` and `:157`): borrow the entry, clone the `Source` once and copy the size out; verify the server integration tests still pass
+- [x] 6.3 Reuse one buffer on the `Server` instead of allocating and zeroing up to 1 MiB per `FILE_RANGE` request (`crates/core/src/server.rs:207`); verify the multi-chunk streaming test and the short-transfer test still pass and that only the bytes the read produced are written to the transport
+- [x] 6.4 Change `build_list` (`crates/core/src/protocol.rs:105-113`) to take borrowed names and `FileList::names` (`crates/core/src/filelist.rs:338-340`) to yield `&str`, so the list command no longer materialises a `Vec<String>` of every name; verify the "list command sends file names then exits" test still passes with the same payload
 
 ## 7. App: split the application module
 
