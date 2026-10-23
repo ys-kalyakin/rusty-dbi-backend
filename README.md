@@ -24,10 +24,10 @@ dbi-backend ~/games
 dbi-backend game1.nsp game2.nsp
 ```
 
-Keys: `a` open the path picker, `c` clear the list, `s` start the server, `S`
-browse network shares, `/` search the list, `q` quit. While the server is
-running, `a`, `c`, and `S` are disabled so the offered list matches the
-running server's snapshot. In the picker: `j`/`k` or the arrow keys move,
+Keys: `a` open the path picker, `c` clear the list, `s` start the server, `H`
+start or stop the HTTP server, `S` browse network shares, `/` search the list,
+`q` quit. While the server is running, `a`, `c`, and `S` are disabled so the
+offered list matches the running server's snapshot. In the picker: `j`/`k` or the arrow keys move,
 `Enter` opens a directory or adds a file, `Space` adds the highlighted directory
 or file, `Backspace` goes up, and `Esc`/`q` cancels.
 
@@ -101,6 +101,37 @@ same file picker over the share (starting at `root` when set); added files
 show as share-qualified paths like `nas:/switch/game.nsp` and stream through
 the share when the Switch asks for them. Opening a stale session retries once;
 if the connection drops mid-transfer it is reported.
+
+## Network installs (HTTP)
+
+DBI v150+ can install titles over the network from an HTTP "Home server"
+source, and the backend can be that server. Press `H` in the TUI and the
+offered files — local and share-backed alike — are served over HTTP from a
+snapshot of the list: the same listing semantics, the same byte-range
+downloads, and the same progress and log lines the USB transfer produces.
+Press `H` again to stop the server. `s` and `H` are independent, so the cable
+and the network can serve at once.
+
+The header shows the URL while the server runs. On the console, add the source
+to `dbi.config` on the SD card and pick it from DBI's menu:
+
+```
+Home server=ApacheHTTP|http://192.168.1.5:65080/
+```
+
+The listing is the shape nginx's `autoindex` produces, each name's href
+percent-encoded so non-ASCII file names round-trip; ASCII names are the safe
+bet for anything the console's parser might choke on.
+
+The server is unauthenticated: it serves the offered files to every host that
+can reach its bind address, so it belongs on a trusted LAN. Set `host` to a
+specific address to keep it off other interfaces:
+
+```toml
+[http]
+host = "0.0.0.0" # every interface by default
+port = 65080
+```
 
 ## Linux permissions
 

@@ -514,6 +514,76 @@ fn log_shows_the_newest_lines() {
     assert!(!view.contains("line-0"));
 }
 
+/// Where the log block starts and how tall it is: its titled top border row,
+/// and the rows from there down to (excluding) the help line.
+fn log_block_geometry(buffer: &ratatui::buffer::Buffer) -> (u16, u16) {
+    let top = (1..buffer.area.height)
+        .find(|y| row_text(buffer, *y).contains("Log"))
+        .expect("the log block's titled border");
+    (top, buffer.area.height - 1 - top)
+}
+
+#[test]
+fn the_log_pane_is_capped_on_a_tall_terminal() {
+    let mut app = no_shares(FileList::new());
+    app.files.insert("a.nsp", "/tmp/a.nsp");
+    for i in 0..20 {
+        app.push_log(format!("line-{i}"));
+    }
+
+    let buf = buffer(&app, 80, 40);
+    let (log_top, log_height) = log_block_geometry(&buf);
+    assert_eq!(log_height, 8, "the log pane never exceeds its cap");
+    // The file list spans from below the header to the log's top border, so
+    // it takes every remaining row: 30 of the 38 free rows.
+    assert_eq!(log_top - 1, 30);
+}
+
+#[test]
+fn the_log_pane_yields_space_on_a_short_terminal() {
+    let mut app = no_shares(FileList::new());
+    app.files.insert("a.nsp", "/tmp/a.nsp");
+    for i in 0..20 {
+        app.push_log(format!("line-{i}"));
+    }
+
+    let buf = buffer(&app, 80, 12);
+    let (log_top, log_height) = log_block_geometry(&buf);
+    assert_eq!(log_height, 7, "the log shrinks below its cap first");
+    assert_eq!(log_top - 1, 3, "the file list keeps its minimum height");
+}
+
+#[test]
+fn the_log_pane_is_capped_while_the_picker_is_open() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut app = app_with_picker(dir.path());
+    for i in 0..20 {
+        app.push_log(format!("line-{i}"));
+    }
+
+    let (_, log_height) = log_block_geometry(&buffer(&app, 80, 40));
+    assert_eq!(log_height, 8);
+}
+
+#[test]
+fn the_log_pane_is_capped_while_serving() {
+    let mut app = no_shares(FileList::new());
+    app.files.insert("game.nsp", "/tmp/game.nsp");
+    app.handle_server_event(ServerEvent::Started);
+    app.update_progress_at("game.nsp".into(), 50, 100, Instant::now());
+    for i in 0..20 {
+        app.push_log(format!("line-{i}"));
+    }
+
+    let buf = buffer(&app, 80, 40);
+    assert!(
+        (0..buf.area.height).any(|y| row_text(&buf, y).contains("Sending game.nsp")),
+        "the progress row is present"
+    );
+    let (_, log_height) = log_block_geometry(&buf);
+    assert_eq!(log_height, 8);
+}
+
 #[test]
 fn a_opens_the_picker() {
     let mut app = no_shares(FileList::new());
@@ -853,7 +923,7 @@ async fn size_column_is_right_aligned_in_the_files_table() {
         .await
         .unwrap();
 
-    let buf = buffer(&app, 80, 12);
+    let buf = buffer(&app, 80, 14);
     // Files rows start below the header (y=0) and the top border (y=1); the last
     // character of a right-aligned size cell is the same 'B' x-position in both rows.
     let size_x = |y: u16| {
@@ -2477,4 +2547,269 @@ fn fill_form(app: &mut App, values: (&str, &str, &str, &str)) {
             app.handle_key(key(KeyCode::Tab));
         }
     }
+}
+
+// --- the HTTP server in the app -----------------------------------------
+
+/// An app whose HTTP server has started serving at `url`.
+fn http_running(files: &[&str], url: &str) -> App {
+    let mut app = app_with_files(files);
+    app.handle_server_event(ServerEvent::HttpStarted {
+        url: url.to_string(),
+    });
+    app
+}
+
+#[test]
+fn h_starts_and_stops_the_http_server() {
+    let mut app = app_with_files(&["a.nsp"]);
+    assert_eq!(app.handle_key(press('H')), Action::StartHttp);
+    assert_eq!(
+        app.handle_key(press('H')),
+        Action::StartHttp,
+        "before the start is confirmed, the key still asks to start"
+    );
+
+    app.handle_server_event(ServerEvent::HttpStarted {
+        url: "http://192.0.2.10:65080/".into(),
+    });
+    assert_eq!(app.handle_key(press('H')), Action::StopHttp);
+
+    app.handle_server_event(ServerEvent::HttpEnded);
+    assert_eq!(app.handle_key(press('H')), Action::StartHttp);
+}
+
+#[test]
+fn h_requires_files() {
+    let mut app = no_shares(FileList::new());
+    assert_eq!(app.handle_key(press('H')), Action::None);
+}
+
+#[test]
+fn either_server_starts_while_the_other_runs() {
+    // The USB server waits for the device; `H` still starts the HTTP one.
+    let mut app = app_with_files(&["a.nsp"]);
+    app.handle_key(press('s'));
+    assert_eq!(app.status, ServerStatus::Waiting);
+    assert_eq!(app.handle_key(press('H')), Action::StartHttp);
+
+    // And with HTTP running, `s` still starts the USB one.
+    let mut app = http_running(&["a.nsp"], "http://192.0.2.10:65080/");
+    assert_eq!(app.handle_key(press('s')), Action::Start);
+}
+
+#[test]
+fn editing_is_blocked_while_the_http_server_runs() {
+    let mut app = http_running(&["a.nsp", "b.nsp"], "http://192.0.2.10:65080/");
+
+    assert_eq!(app.handle_key(press('a')), Action::None);
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(app.handle_key(press('d')), Action::None);
+    assert_eq!(app.files.len(), 2);
+    assert_eq!(app.handle_key(press('c')), Action::None);
+    assert!(matches!(app.mode, Mode::Normal));
+    assert_eq!(app.handle_key(press('S')), Action::None);
+    assert!(matches!(app.mode, Mode::Normal));
+}
+
+#[test]
+fn hint_chips_dim_locked_keys_while_the_http_server_is_active() {
+    let active = http_running(&["a.nsp"], "http://192.0.2.10:65080/");
+    let buf = buffer(&active, 60, 12);
+    let y = buf.area.height - 1;
+    let fgs: Vec<_> = (0..buf.area.width)
+        .map(|x| buf.cell((x, y)).unwrap().fg)
+        .collect();
+    assert!(
+        fgs.iter().filter(|c| **c == theme::MUTED).count() >= 12,
+        "locked a/d/c chips render dimmed"
+    );
+    assert!(
+        fgs.contains(&theme::ACCENT),
+        "unlocked keys stay accented, H among them"
+    );
+}
+
+#[test]
+fn the_http_events_drive_the_state() {
+    let mut app = app_with_files(&["a.nsp"]);
+    app.handle_server_event(ServerEvent::HttpStarted {
+        url: "http://192.0.2.10:65080/".into(),
+    });
+    assert_eq!(app.http, HttpServerStatus::Running);
+    assert_eq!(app.http_url.as_deref(), Some("http://192.0.2.10:65080/"));
+
+    app.handle_server_event(ServerEvent::Progress {
+        name: "a.nsp".into(),
+        sent: 5,
+        total: 10,
+    });
+    assert_eq!(app.progress.as_ref().unwrap().name, "a.nsp");
+
+    app.handle_server_event(ServerEvent::HttpEnded);
+    assert_eq!(app.http, HttpServerStatus::Idle);
+    assert_eq!(app.http_url, None);
+    assert!(app.progress.is_none(), "no stale bar outlives the stop");
+}
+
+#[test]
+fn the_header_shows_the_http_state_and_url() {
+    let app = app_with_files(&["a.nsp"]);
+    assert!(render(&app, 100, 12).contains("http idle"));
+
+    let app = http_running(&["a.nsp"], "http://192.0.2.10:65080/");
+    let view = render(&app, 120, 12);
+    assert!(
+        view.contains("http http://192.0.2.10:65080/"),
+        "the running state names the URL: {view}"
+    );
+}
+
+#[test]
+fn an_http_download_shows_in_the_progress_region() {
+    let mut app = http_running(&["a.nsp"], "http://192.0.2.10:65080/");
+    app.handle_server_event(ServerEvent::Progress {
+        name: "a.nsp".into(),
+        sent: 5,
+        total: 10,
+    });
+    let view = render(&app, 80, 12);
+    assert!(view.contains("Sending a.nsp"), "{view}");
+    assert!(view.contains("50%"), "{view}");
+}
+
+#[test]
+fn an_http_completion_writes_one_success_line_and_clears_the_bar() {
+    let mut app = http_running(&["a.nsp"], "http://192.0.2.10:65080/");
+    app.handle_server_event(ServerEvent::Progress {
+        name: "a.nsp".into(),
+        sent: 5,
+        total: 10,
+    });
+    app.handle_server_event(ServerEvent::Completed {
+        name: "a.nsp".into(),
+        bytes: 10,
+    });
+    assert!(app.progress.is_none());
+    let sent_lines = app
+        .log
+        .iter()
+        .filter(|line| line.message.starts_with("Sent: a.nsp"))
+        .collect::<Vec<_>>();
+    assert_eq!(sent_lines.len(), 1);
+    assert!(sent_lines[0].message.contains("10 B"));
+}
+
+#[test]
+fn concurrent_streams_follow_the_latest_sample() {
+    let mut app = http_running(&["a.nsp", "b.nsp"], "http://192.0.2.10:65080/");
+    app.handle_server_event(ServerEvent::Progress {
+        name: "a.nsp".into(),
+        sent: 5,
+        total: 10,
+    });
+    app.handle_server_event(ServerEvent::Progress {
+        name: "b.nsp".into(),
+        sent: 1,
+        total: 4,
+    });
+    let progress = app.progress.as_ref().unwrap();
+    assert_eq!(progress.name, "b.nsp");
+    assert_eq!(progress.sent, 1);
+    assert_eq!(progress.total, 4);
+}
+
+#[test]
+fn the_help_overlay_lists_the_http_key() {
+    let mut app = no_shares(FileList::new());
+    app.handle_key(press('?'));
+    let view = render(&app, 80, 24);
+    assert!(view.contains("H   start/stop the HTTP server"), "{view}");
+}
+
+/// The bind-failure path: a port already taken is logged once and the run
+/// ends, so the state returns to idle and the server is startable again.
+#[tokio::test]
+async fn a_bind_failure_is_logged_once_and_ends_the_run() {
+    use crate::config::HttpSettings;
+    use tokio::sync::mpsc;
+
+    let occupied = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+        .await
+        .unwrap();
+    let port = occupied.local_addr().unwrap().port();
+
+    let mut files = FileList::new();
+    files.insert("a.nsp", "/tmp/a.nsp");
+    let (log_tx, mut log_rx) = mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let _stop = spawn_http_server(
+        files,
+        Arc::new(LocalStore::new()),
+        HttpSettings {
+            host: "127.0.0.1".to_string(),
+            port,
+        },
+        log_tx,
+        event_tx,
+    );
+
+    let line = tokio::time::timeout(Duration::from_secs(2), log_rx.recv())
+        .await
+        .expect("the failure is logged")
+        .unwrap();
+    assert!(line.contains("cannot bind"), "{line}");
+    match tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        .await
+        .expect("the run ends")
+        .unwrap()
+    {
+        ServerEvent::HttpEnded => {}
+        other => panic!("expected the run to end, got {other:?}"),
+    }
+}
+
+/// A successful start reports the served URL, and the stop switch ends the
+/// run and reports it.
+#[tokio::test]
+async fn the_http_task_serves_and_stops() {
+    use crate::config::HttpSettings;
+    use tokio::sync::mpsc;
+
+    let mut files = FileList::new();
+    files.insert("a.nsp", "/tmp/a.nsp");
+    let (log_tx, mut log_rx) = mpsc::unbounded_channel();
+    let (event_tx, mut event_rx) = mpsc::unbounded_channel();
+    let stop = spawn_http_server(
+        files,
+        Arc::new(LocalStore::new()),
+        HttpSettings {
+            host: "127.0.0.1".to_string(),
+            port: 0,
+        },
+        log_tx,
+        event_tx,
+    );
+
+    match tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        .await
+        .expect("the start is reported")
+        .unwrap()
+    {
+        ServerEvent::HttpStarted { url } => {
+            assert!(url.starts_with("http://127.0.0.1:"), "{url}");
+        }
+        other => panic!("expected a start with the URL, got {other:?}"),
+    }
+
+    stop.send(true).unwrap();
+    match tokio::time::timeout(Duration::from_secs(2), event_rx.recv())
+        .await
+        .expect("the stop is reported")
+        .unwrap()
+    {
+        ServerEvent::HttpEnded => {}
+        other => panic!("expected the end, got {other:?}"),
+    }
+    drop(log_rx.recv().await);
 }

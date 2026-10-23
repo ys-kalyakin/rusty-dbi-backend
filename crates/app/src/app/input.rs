@@ -5,8 +5,8 @@ use crossterm::event::{KeyCode, KeyEvent, KeyEventKind, KeyModifiers};
 use dbi_backend_core::source::Source;
 
 use super::state::{
-    clamped_step, Action, App, ConfirmKind, Mode, PasswordModal, ServerStatus, ShareFormState,
-    ShareList,
+    clamped_step, Action, App, ConfirmKind, HttpServerStatus, Mode, PasswordModal, ServerStatus,
+    ShareFormState, ShareList,
 };
 use crate::picker::Picker;
 use dbi_backend_core::source::EntryKind;
@@ -185,9 +185,9 @@ impl App {
             return self.handle_search_key(key);
         }
 
-        // While the server task is active (waiting or running), edits are inert so
-        // the offered list matches the server's snapshot.
-        let running = self.status != ServerStatus::Idle;
+        // While either server task is active (waiting or running), edits are
+        // inert so the offered list matches the running servers' snapshots.
+        let running = self.status != ServerStatus::Idle || self.http != HttpServerStatus::Idle;
         match key.code {
             KeyCode::Char('q') => {
                 self.mode = Mode::Confirm(ConfirmKind::Quit);
@@ -233,6 +233,17 @@ impl App {
                     Action::Start
                 } else {
                     Action::None
+                }
+            }
+            KeyCode::Char('H') => {
+                if self.http == HttpServerStatus::Idle {
+                    if self.files.is_empty() {
+                        Action::None
+                    } else {
+                        Action::StartHttp
+                    }
+                } else {
+                    Action::StopHttp
                 }
             }
             KeyCode::Char('S') => {

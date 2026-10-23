@@ -16,10 +16,10 @@ use dbi_backend_core::filters::Filters;
 use dbi_backend_core::source::smb::{ShareHub, Smb2SessionFactory};
 use dbi_backend_core::source::CombinedStore;
 use dbi_backend_core::source::Source;
-use tokio::sync::mpsc;
+use tokio::sync::{mpsc, watch};
 
 use app::{Action, App, ServerEvent};
-use config::{load_user_config, FilterSettings};
+use config::{load_user_config, FilterSettings, HttpSettings};
 
 #[tokio::main]
 async fn main() -> Result<()> {
@@ -59,6 +59,9 @@ async fn main() -> Result<()> {
     }
 
     let mut app = App::with_shares(files, loaded.shares);
+    let http_settings = loaded.http;
+    // The stop switch of the running HTTP server, held while it serves.
+    let mut http_stop: Option<watch::Sender<bool>> = None;
     // The startup adds are reported in the log region too: the terminal
     // warnings scroll away under the TUI's alternate screen.
     for (display, outcome) in &startup_adds {
@@ -90,6 +93,8 @@ async fn main() -> Result<()> {
                             &mut app,
                             &shares,
                             store.clone(),
+                            &http_settings,
+                            &mut http_stop,
                             &log_tx,
                             &event_tx,
                         )
@@ -124,13 +129,17 @@ fn input_thread(tx: mpsc::Sender<Event>) {
     }
 }
 
-/// Run the async consequences of a key action: share connects, share listings,
-/// and share adds. Returns `true` when the app should quit.
+/// Run the async consequences of a key action: share connects, share
+/// listings, share adds, and the HTTP server's start and stop. Returns `true`
+/// when the app should quit.
+#[allow(clippy::too_many_arguments)]
 async fn run_action(
     action: Action,
     app: &mut App,
     shares: &Arc<tokio::sync::Mutex<ShareHub>>,
     store: Arc<dyn dbi_backend_core::source::Sources>,
+    http: &HttpSettings,
+    http_stop: &mut Option<watch::Sender<bool>>,
     log_tx: &mpsc::UnboundedSender<String>,
     event_tx: &mpsc::UnboundedSender<ServerEvent>,
 ) -> bool {
@@ -143,6 +152,20 @@ async fn run_action(
                 log_tx.clone(),
                 event_tx.clone(),
             );
+        }
+        Action::StartHttp => {
+            http_stop.replace(app::spawn_http_server(
+                app.files.clone(),
+                store.clone(),
+                http.clone(),
+                log_tx.clone(),
+                event_tx.clone(),
+            ));
+        }
+        Action::StopHttp => {
+            if let Some(stop) = http_stop.take() {
+                stop.send(true).ok();
+            }
         }
         Action::Quit => return true,
         Action::Connect {
@@ -315,6 +338,8 @@ mod tests {
             &mut app,
             &hub,
             noop_store(),
+            &HttpSettings::default(),
+            &mut None,
             &mpsc::unbounded_channel().0,
             &mpsc::unbounded_channel().0,
         )
@@ -376,6 +401,8 @@ mod tests {
             &mut app,
             &hub,
             noop_store(),
+            &HttpSettings::default(),
+            &mut None,
             &mpsc::unbounded_channel().0,
             &mpsc::unbounded_channel().0,
         )
@@ -419,6 +446,8 @@ mod tests {
             &mut app,
             &hub,
             noop_store(),
+            &HttpSettings::default(),
+            &mut None,
             &mpsc::unbounded_channel().0,
             &mpsc::unbounded_channel().0,
         )

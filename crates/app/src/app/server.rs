@@ -1,16 +1,21 @@
-//! The background server task: it waits for the Switch, answers it, and
-//! reports what it did.
+//! The background server tasks: the USB task waits for the Switch and answers
+//! it, the HTTP task serves DBI's network installs, and both report what they
+//! did.
 
 use std::sync::Arc;
 use std::time::Duration;
 
 use dbi_backend_core::filelist::FileList;
+use dbi_backend_core::http::server::{self as http_server, HttpUpdate};
 use dbi_backend_core::server::{Server, ServerUpdate};
 use dbi_backend_core::source::Sources;
 use dbi_backend_core::transport::usb::UsbTransport;
+use tokio::net::TcpListener;
 use tokio::sync::mpsc::UnboundedSender;
+use tokio::sync::watch;
 
 use super::state::ServerEvent;
+use crate::config::HttpSettings;
 
 /// Decides which connection attempts reach the log.
 ///
@@ -107,4 +112,109 @@ pub fn spawn_server(
             }
         }
     });
+}
+
+/// Spawn the background HTTP server loop. Returns the switch that stops it.
+/// Logs are forwarded to `log_tx`, lifecycle transitions and progress to
+/// `event_tx`; a bind failure is logged once and the run ends at once.
+pub fn spawn_http_server(
+    files: FileList,
+    store: Arc<dyn Sources>,
+    settings: HttpSettings,
+    log_tx: UnboundedSender<String>,
+    event_tx: UnboundedSender<ServerEvent>,
+) -> watch::Sender<bool> {
+    let (stop, shutdown) = watch::channel(false);
+    tokio::spawn(async move {
+        let listener = match TcpListener::bind((settings.host.as_str(), settings.port)).await {
+            Ok(listener) => listener,
+            Err(e) => {
+                let _ = log_tx.send(format!(
+                    "HTTP error: cannot bind {}:{}: {e}",
+                    settings.host, settings.port
+                ));
+                let _ = event_tx.send(ServerEvent::HttpEnded);
+                return;
+            }
+        };
+        let port = listener
+            .local_addr()
+            .map(|address| address.port())
+            .unwrap_or(settings.port);
+        let url = format!("http://{}:{port}/", display_host(&settings.host));
+        let _ = log_tx.send(format!("HTTP server listening on {url}"));
+        let _ = event_tx.send(ServerEvent::HttpStarted { url });
+
+        let (updates_tx, mut updates_rx) = http_server::updates_channel();
+        let serve = http_server::serve(listener, files, store, shutdown, updates_tx);
+        tokio::pin!(serve);
+        loop {
+            tokio::select! {
+                update = updates_rx.recv() => {
+                    match update {
+                        Some(HttpUpdate::Log(line)) => {
+                            let _ = log_tx.send(line);
+                        }
+                        Some(HttpUpdate::Progress { name, sent, total }) => {
+                            let _ = event_tx.send(ServerEvent::Progress { name, sent, total });
+                        }
+                        Some(HttpUpdate::Completed { name, bytes }) => {
+                            let _ = event_tx.send(ServerEvent::Completed { name, bytes });
+                        }
+                        None => break,
+                    }
+                }
+                result = &mut serve => {
+                    if let Err(e) = result {
+                        let _ = log_tx.send(format!("HTTP error: {e}"));
+                    }
+                    break;
+                }
+            }
+        }
+        let _ = log_tx.send("HTTP server stopped".into());
+        let _ = event_tx.send(ServerEvent::HttpEnded);
+    });
+    stop
+}
+
+/// The host to show in the served URL: a specific bind host as configured,
+/// or — for a wildcard bind — this machine's address on the route toward an
+/// external host, found by connecting an unconnected (UDP) socket, which
+/// sends nothing. Falls back to the wildcard itself when nothing is found.
+pub(crate) fn display_host(bind_host: &str) -> String {
+    if bind_host != "0.0.0.0" && bind_host != "::" && !bind_host.is_empty() {
+        return bind_host.to_string();
+    }
+    let any = if bind_host == "::" {
+        "[::]:0"
+    } else {
+        "0.0.0.0:0"
+    };
+    std::net::UdpSocket::bind(any)
+        .and_then(|socket| {
+            socket.connect("192.0.2.1:80")?;
+            socket.local_addr()
+        })
+        .map(|address| address.ip().to_string())
+        .unwrap_or_else(|_| bind_host.to_string())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn a_specific_bind_host_is_shown_as_configured() {
+        assert_eq!(display_host("127.0.0.1"), "127.0.0.1");
+        assert_eq!(display_host("192.168.1.5"), "192.168.1.5");
+    }
+
+    #[test]
+    fn a_wildcard_bind_resolves_without_hanging() {
+        // The lookup must answer, not hang; on a machine with any route it
+        // names that route's local address, and with none it falls back.
+        let found = display_host("0.0.0.0");
+        assert!(!found.is_empty());
+    }
 }

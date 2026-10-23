@@ -15,6 +15,27 @@ pub use dbi_backend_core::source::smb::ShareConfig;
 /// The port an SMB share speaks on when its `server` names none.
 const DEFAULT_SMB_PORT: u16 = 445;
 
+/// The HTTP server's bind settings, from the `[http]` config section. There is
+/// deliberately no authentication setting: the server is unauthenticated and
+/// LAN-scoped, and its secrets-free shape stays that way.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HttpSettings {
+    pub host: String,
+    pub port: u16,
+}
+
+impl Default for HttpSettings {
+    fn default() -> Self {
+        Self {
+            host: "0.0.0.0".to_string(),
+            port: DEFAULT_HTTP_PORT,
+        }
+    }
+}
+
+/// The port the HTTP server listens on when the config names none.
+const DEFAULT_HTTP_PORT: u16 = 65080;
+
 /// The configuration file's `[[shares]]` entries.
 #[derive(Deserialize, Default)]
 struct ConfigFile {
@@ -23,6 +44,9 @@ struct ConfigFile {
     /// The `[filters]` section: which files a scan accepts.
     #[serde(default)]
     filters: Option<toml::Table>,
+    /// The `[http]` section: where the HTTP server binds.
+    #[serde(default)]
+    http: Option<toml::Table>,
 }
 
 /// The filter settings one source asks for — the command line or the config
@@ -44,6 +68,7 @@ pub struct FilterSettings {
 pub struct LoadedConfig {
     pub shares: Vec<ShareConfig>,
     pub filters: FilterSettings,
+    pub http: HttpSettings,
     pub warnings: Vec<String>,
 }
 
@@ -217,7 +242,30 @@ pub fn parse_contents(contents: &str) -> LoadedConfig {
     if let Some(table) = &file.filters {
         loaded.filters = parse_filters(table, &mut loaded.warnings);
     }
+    if let Some(table) = &file.http {
+        loaded.http = parse_http(table, &mut loaded.warnings);
+    }
     loaded
+}
+
+/// Read the `[http]` section: the bind host and port. A malformed value warns
+/// and leaves that one setting at its default; a key the section does not
+/// define warns so a typo cannot silently change the bind.
+fn parse_http(table: &toml::Table, warnings: &mut Vec<String>) -> HttpSettings {
+    let mut settings = HttpSettings::default();
+    for (key, value) in table {
+        match (key.as_str(), value) {
+            ("host", toml::Value::String(host)) => settings.host = host.clone(),
+            ("host", _) => warnings.push("config: http: host must be a string".to_string()),
+            ("port", toml::Value::Integer(port)) => match u16::try_from(*port) {
+                Ok(port) => settings.port = port,
+                Err(_) => warnings.push(format!("config: http: port {port} is not a port number")),
+            },
+            ("port", _) => warnings.push("config: http: port must be a number".to_string()),
+            (other, _) => warnings.push(format!("config: http: unknown key {other:?}")),
+        }
+    }
+    settings
 }
 
 /// Read the `[filters]` section: the accepted extensions, the include
@@ -340,6 +388,7 @@ impl LoadedConfig {
             Err(e) => LoadedConfig {
                 shares: Vec::new(),
                 filters: FilterSettings::default(),
+                http: HttpSettings::default(),
                 warnings: vec![format!("cannot read {}: {e}", path.display())],
             },
         }
@@ -812,5 +861,74 @@ mod tests {
         let loaded = config("[filters]\nextensions = []\n");
         assert_eq!(loaded.warnings, Vec::<String>::new());
         assert_eq!(loaded.filters.extensions, None);
+    }
+
+    // --- the [http] section -------------------------------------------------
+
+    #[test]
+    fn the_http_defaults_apply_without_the_section() {
+        let loaded = config("");
+        assert_eq!(loaded.warnings, Vec::<String>::new());
+        assert_eq!(
+            loaded.http,
+            HttpSettings {
+                host: "0.0.0.0".to_string(),
+                port: 65080,
+            }
+        );
+    }
+
+    #[test]
+    fn the_http_section_sets_host_and_port() {
+        let loaded = config("[http]\nhost = \"127.0.0.1\"\nport = 8080\n");
+        assert_eq!(loaded.warnings, Vec::<String>::new());
+        assert_eq!(
+            loaded.http,
+            HttpSettings {
+                host: "127.0.0.1".to_string(),
+                port: 8080,
+            }
+        );
+    }
+
+    #[test]
+    fn a_bad_http_port_warns_and_keeps_the_default() {
+        let loaded = config("[http]\nport = \"many\"\n");
+        assert_eq!(loaded.http.port, 65080);
+        assert_eq!(loaded.warnings.len(), 1);
+        assert!(loaded.warnings[0].contains("port must be a number"));
+    }
+
+    #[test]
+    fn an_out_of_range_http_port_warns_and_keeps_the_default() {
+        let loaded = config("[http]\nport = 70000\n");
+        assert_eq!(loaded.http.port, 65080);
+        assert_eq!(loaded.warnings.len(), 1);
+        assert!(loaded.warnings[0].contains("70000 is not a port number"));
+    }
+
+    #[test]
+    fn an_unknown_http_key_warns() {
+        let loaded = config("[http]\npassword = \"no\"\n");
+        assert_eq!(
+            loaded.http,
+            HttpSettings::default(),
+            "the unknown key changes nothing"
+        );
+        assert_eq!(loaded.warnings.len(), 1);
+        assert!(loaded.warnings[0].contains("unknown key"));
+    }
+
+    #[test]
+    fn the_readme_http_snippet_parses() {
+        let blocks = readme_toml_blocks();
+        let block = blocks
+            .iter()
+            .find(|block| block.contains("[http]"))
+            .expect("the README documents the http section");
+        let loaded = parse_contents(block);
+
+        assert_eq!(loaded.warnings, Vec::<String>::new());
+        assert_eq!(loaded.http.port, 65080);
     }
 }

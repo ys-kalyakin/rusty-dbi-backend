@@ -29,6 +29,15 @@ pub enum ServerStatus {
     Running,
 }
 
+/// The HTTP server's state: unlike the USB task it has nothing to wait for,
+/// so it is only ever running or idle.
+#[derive(Clone, Copy, PartialEq, Eq, Debug, Default)]
+pub enum HttpServerStatus {
+    #[default]
+    Idle,
+    Running,
+}
+
 /// What the caller should do after a key press.
 #[derive(Debug, PartialEq, Eq)]
 pub enum Action {
@@ -50,14 +59,25 @@ pub enum Action {
     AddShare {
         config: ShareConfig,
     },
+    /// Start the HTTP server over the current list snapshot.
+    StartHttp,
+    /// Stop the running HTTP server.
+    StopHttp,
 }
 
-/// A lifecycle or progress transition reported by the background server task.
+/// A lifecycle or progress transition reported by a background server task.
 #[derive(Debug, Clone)]
 pub enum ServerEvent {
     Started,
     Disconnected,
     Ended,
+    /// The HTTP server began serving; `url` is the address to enter on a
+    /// console.
+    HttpStarted {
+        url: String,
+    },
+    /// The HTTP server stopped, by request or on a failure.
+    HttpEnded,
     Progress {
         name: String,
         sent: u64,
@@ -252,6 +272,10 @@ pub struct App {
     pub files: FileList,
     pub log: VecDeque<LogLine>,
     pub status: ServerStatus,
+    /// The HTTP server's state, independent of the USB task's.
+    pub http: HttpServerStatus,
+    /// The URL the running HTTP server is reachable at, for the header.
+    pub http_url: Option<String>,
     pub mode: Mode,
     pub should_quit: bool,
     pub selected: usize,
@@ -290,6 +314,8 @@ impl App {
             files,
             log: VecDeque::new(),
             status: ServerStatus::Idle,
+            http: HttpServerStatus::Idle,
+            http_url: None,
             mode: Mode::Normal,
             should_quit: false,
             selected: 0,
@@ -310,7 +336,7 @@ impl App {
         }
     }
 
-    /// Apply a lifecycle or progress transition from the background server task.
+    /// Apply a lifecycle or progress transition from a background server task.
     pub fn handle_server_event(&mut self, event: ServerEvent) {
         match event {
             ServerEvent::Started => {
@@ -324,6 +350,16 @@ impl App {
             }
             ServerEvent::Ended => {
                 self.status = ServerStatus::Idle;
+                self.progress = None;
+            }
+            ServerEvent::HttpStarted { url } => {
+                self.http = HttpServerStatus::Running;
+                self.http_url = Some(url);
+            }
+            ServerEvent::HttpEnded => {
+                self.http = HttpServerStatus::Idle;
+                self.http_url = None;
+                // A bar left over from a stopped download must not linger.
                 self.progress = None;
             }
             ServerEvent::Progress { name, sent, total } => {

@@ -11,8 +11,8 @@ use std::time::Duration;
 
 use super::format::{abbrev_path, format_elapsed, human_size, log_color, plural};
 use super::state::{
-    App, ConfirmKind, Mode, PasswordModal, ServerStatus, ShareFormState, ShareList,
-    SHARE_FORM_FIELDS,
+    App, ConfirmKind, HttpServerStatus, Mode, PasswordModal, ServerStatus, ShareFormState,
+    ShareList, SHARE_FORM_FIELDS,
 };
 use crate::picker::Picker;
 use crate::theme;
@@ -32,19 +32,20 @@ const SHARE_FORM_HINT: &str = "Tab next  Enter save  Esc cancel";
 
 /// The normal-view hint broken into keyed chip pairs: bracketed key text, label
 /// remainder, and the key character (for locked-out detection).
-const NORMAL_ACTIONS: [(&str, &str, char); 8] = [
+const NORMAL_ACTIONS: [(&str, &str, char); 9] = [
     ("[a]", "dd", 'a'),
     ("[d]", "elete", 'd'),
     ("[c]", "lear", 'c'),
     ("[s]", "tart", 's'),
+    ("[H]", "ttp", 'H'),
     ("[S]", "hares", 'S'),
     ("[/]", "search", '/'),
     ("[q]", "uit", 'q'),
     ("[?]", " help", '?'),
 ];
 
-/// The normal-mode hint as keyed chips. While the server task is active the
-/// locked-out editing keys (`a`/`d`/`c`/`S`) are rendered dimmed.
+/// The normal-mode hint as keyed chips. While either server task is active
+/// the locked-out editing keys (`a`/`d`/`c`/`S`) are rendered dimmed.
 fn normal_hint_line(server_active: bool) -> Line<'static> {
     let mut spans: Vec<Span> = Vec::new();
     for (index, (key, label, key_char)) in NORMAL_ACTIONS.iter().enumerate() {
@@ -65,13 +66,15 @@ fn normal_hint_line(server_active: bool) -> Line<'static> {
 
 pub fn ui(frame: &mut Frame, app: &App) {
     let area = frame.area();
-    let show_progress = app.status == ServerStatus::Running && app.progress.is_some();
+    let either_running =
+        app.status == ServerStatus::Running || app.http == HttpServerStatus::Running;
+    let show_progress = either_running && app.progress.is_some();
 
     let mut constraints = vec![Constraint::Length(1), Constraint::Min(3)];
     if show_progress {
         constraints.push(Constraint::Length(1));
     }
-    constraints.push(Constraint::Min(3));
+    constraints.push(Constraint::Max(LOG_PANE_MAX_HEIGHT));
     constraints.push(Constraint::Length(1));
     let chunks = Layout::default()
         .direction(Direction::Vertical)
@@ -140,12 +143,27 @@ fn render_header(frame: &mut Frame, app: &App, area: Rect) {
         Span::styled(state_text, theme::fg(color)),
     ]);
     let count = plural(app.files.len(), "file", "files");
-    let right = format!("{count} · total: {}", human_size(app.files.total_size()));
+    let mut right_spans = vec![Span::raw(format!(
+        "{count} · total: {}",
+        human_size(app.files.total_size())
+    ))];
+    match app.http {
+        HttpServerStatus::Running => {
+            let url = app.http_url.as_deref().unwrap_or_default();
+            right_spans.push(Span::raw("  "));
+            right_spans.push(Span::styled(
+                format!("● http {url}"),
+                theme::fg(theme::SUCCESS),
+            ));
+        }
+        HttpServerStatus::Idle => {
+            right_spans.push(Span::raw("  "));
+            right_spans.push(Span::styled("○ http idle", theme::muted()));
+        }
+    }
     frame.render_widget(Paragraph::new(left), halves[0]);
     frame.render_widget(
-        Paragraph::new(right)
-            .style(theme::muted())
-            .alignment(Alignment::Right),
+        Paragraph::new(Line::from(right_spans)).alignment(Alignment::Right),
         halves[1],
     );
 }
@@ -332,6 +350,11 @@ fn render_progress(frame: &mut Frame, app: &App, area: Rect) {
     frame.render_widget(gauge, halves[1]);
 }
 
+/// The most rows the log pane ever takes: its titled border plus up to 6 log
+/// lines. Every row beyond it belongs to the primary region; on a terminal
+/// too short for this, the log yields first.
+const LOG_PANE_MAX_HEIGHT: u16 = 8;
+
 fn render_log(frame: &mut Frame, app: &App, area: Rect) {
     let inner_height = area.height.saturating_sub(2) as usize;
     let start = app.log.len().saturating_sub(inner_height);
@@ -373,7 +396,9 @@ fn render_help(frame: &mut Frame, app: &App, area: Rect) {
             Span::raw("  "),
             Span::styled(SEARCH_HINT, theme::muted()),
         ]),
-        _ => normal_hint_line(app.status != ServerStatus::Idle),
+        _ => {
+            normal_hint_line(app.status != ServerStatus::Idle || app.http != HttpServerStatus::Idle)
+        }
     };
     frame.render_widget(Paragraph::new(line), area);
 }
@@ -500,7 +525,8 @@ fn render_help_overlay(frame: &mut Frame, area: Rect) {
         Line::from("a   open the path picker"),
         Line::from("d   remove the highlighted file"),
         Line::from("c   clear the file list (confirm)"),
-        Line::from("s   start the server"),
+        Line::from("s   start the USB server"),
+        Line::from("H   start/stop the HTTP server"),
         Line::from("S   list configured shares"),
         Line::from("Share list: Enter connect, a add share, Esc cancel"),
         Line::from("j/k or arrows   move the highlight"),
