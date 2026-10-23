@@ -3,19 +3,27 @@
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
+use crate::filters::Filters;
+use crate::metadata::{self, TitleIdentity};
 use crate::source::{EntryKind, Source, SourceError, Sources};
 
-/// A single offered file: where its bytes come from and its size in bytes.
+/// A single offered file: where its bytes come from, its size in bytes, and
+/// what it is.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileEntry {
     pub source: Source,
     pub size: u64,
+    /// What the file is: its title id, the kind of content it is and its
+    /// version. Empty when the file's identity could not be determined.
+    pub identity: TitleIdentity,
 }
 
 /// Name-to-entry map. A `BTreeMap` keeps the listing deterministic (sorted by name).
 #[derive(Debug, Default, Clone)]
 pub struct FileList {
     files: BTreeMap<String, FileEntry>,
+    /// The rules a directory scan accepts files by.
+    filters: Filters,
 }
 
 /// What an [`FileList::add_path`] call did, so callers can report warnings.
@@ -27,6 +35,8 @@ pub struct AddOutcome {
     pub skipped: Vec<Source>,
     /// Names that replaced a previously added entry.
     pub replaced: Vec<String>,
+    /// How many files the filters rejected during a scan.
+    pub rejected: usize,
 }
 
 impl FileList {
@@ -34,19 +44,24 @@ impl FileList {
         Self::default()
     }
 
+    /// A list whose directory scans accept the files the given filters accept.
+    pub fn with_filters(filters: Filters) -> Self {
+        Self {
+            filters,
+            ..Self::default()
+        }
+    }
+
     /// Insert an entry by name, returning the source it replaced, if any.
     pub fn insert(&mut self, name: impl Into<String>, path: impl Into<PathBuf>) -> Option<Source> {
         let path = path.into();
         let size = file_size(&path);
-        self.files
-            .insert(
-                name.into(),
-                FileEntry {
-                    source: Source::Local(path),
-                    size,
-                },
-            )
-            .map(|entry| entry.source)
+        self.put(
+            name.into(),
+            Source::Local(path),
+            size,
+            TitleIdentity::default(),
+        )
     }
 
     /// Insert an exact entry: any source with a known size, no filesystem
@@ -57,8 +72,27 @@ impl FileList {
         source: Source,
         size: u64,
     ) -> Option<Source> {
+        self.put(name.into(), source, size, TitleIdentity::default())
+    }
+
+    /// Put one entry into the list under its name, returning the source it
+    /// replaced, if any.
+    fn put(
+        &mut self,
+        name: String,
+        source: Source,
+        size: u64,
+        identity: TitleIdentity,
+    ) -> Option<Source> {
         self.files
-            .insert(name.into(), FileEntry { source, size })
+            .insert(
+                name,
+                FileEntry {
+                    source,
+                    size,
+                    identity,
+                },
+            )
             .map(|entry| entry.source)
     }
 
@@ -69,10 +103,17 @@ impl FileList {
     /// subdirectories that cannot be read are skipped and reported in the outcome
     /// rather than aborting the scan; only a failure to read the given path itself
     /// is returned as an error.
-    pub fn add_path(&mut self, path: &Path) -> std::io::Result<AddOutcome> {
+    ///
+    /// The store reads each accepted file's identity, so a file on a share is
+    /// read the same way as a local one.
+    pub async fn add_path(
+        &mut self,
+        path: &Path,
+        store: &dyn Sources,
+    ) -> std::io::Result<AddOutcome> {
         let mut outcome = AddOutcome::default();
         if path.is_file() {
-            self.add_file(path, &mut outcome);
+            self.add_file(path, store, &mut outcome).await;
             return Ok(outcome);
         }
 
@@ -109,15 +150,21 @@ impl FileList {
                 if file_type.is_dir() {
                     stack.push(child);
                 } else if file_type.is_file() {
-                    if has_target_ext(&child) {
-                        self.add_file(&child, &mut outcome);
+                    if self.accepts_name(&child) {
+                        self.add_file(&child, store, &mut outcome).await;
+                    } else {
+                        outcome.rejected += 1;
                     }
                 } else if file_type.is_symlink() {
                     // Follow file symlinks, but never descend into directory symlinks
                     // (avoids cycles). Broken links are ignored.
                     if let Ok(meta) = std::fs::metadata(&child) {
-                        if meta.is_file() && has_target_ext(&child) {
-                            self.add_file(&child, &mut outcome);
+                        if meta.is_file() {
+                            if self.accepts_name(&child) {
+                                self.add_file(&child, store, &mut outcome).await;
+                            } else {
+                                outcome.rejected += 1;
+                            }
                         }
                     }
                 }
@@ -126,15 +173,56 @@ impl FileList {
         Ok(outcome)
     }
 
-    fn add_file(&mut self, path: &Path, outcome: &mut AddOutcome) {
+    async fn add_file(&mut self, path: &Path, store: &dyn Sources, outcome: &mut AddOutcome) {
         let size = std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0);
-        self.record(Source::Local(path.to_path_buf()), size, outcome);
+        let name = path
+            .file_name()
+            .map(|name| name.to_string_lossy().into_owned())
+            .unwrap_or_default();
+        let identity = self
+            .read_identity(store, &Source::Local(path.to_path_buf()), &name)
+            .await;
+        self.record(Source::Local(path.to_path_buf()), size, identity, outcome);
+    }
+
+    /// Read a file's identity through the store, so a file on a share is read
+    /// the same way as a local one. A file that is not a container the reader
+    /// knows is not read at all, and a read that fails yields an empty
+    /// identity: the identity never decides whether a file is offered.
+    async fn read_identity(
+        &self,
+        store: &dyn Sources,
+        source: &Source,
+        name: &str,
+    ) -> TitleIdentity {
+        if !metadata::is_container_file(name) {
+            return TitleIdentity::default();
+        }
+        let Ok(mut handle) = store.open(source).await else {
+            return TitleIdentity::default();
+        };
+        metadata::read_identity(&mut *handle, name).await
+    }
+
+    /// Whether a scan accepts the file at this path. The filters judge the
+    /// file name, never the path it was found at.
+    fn accepts_name(&self, path: &Path) -> bool {
+        match path.file_name() {
+            Some(name) => self.filters.accepts(&name.to_string_lossy()),
+            None => false,
+        }
     }
 
     /// Record one entry under its file name, reporting a replacement when the
     /// name was already present. Local sources resolve symlinks here, as the
     /// old path-based add always did.
-    fn record(&mut self, source: Source, size: u64, outcome: &mut AddOutcome) {
+    fn record(
+        &mut self,
+        source: Source,
+        size: u64,
+        identity: TitleIdentity,
+        outcome: &mut AddOutcome,
+    ) {
         let resolved = match source {
             Source::Local(path) => {
                 Source::Local(path.canonicalize().unwrap_or_else(|_| path.clone()))
@@ -142,17 +230,7 @@ impl FileList {
             other => other,
         };
         if let Some(name) = resolved.file_name() {
-            if self
-                .files
-                .insert(
-                    name.clone(),
-                    FileEntry {
-                        source: resolved,
-                        size,
-                    },
-                )
-                .is_some()
-            {
+            if self.put(name.clone(), resolved, size, identity).is_some() {
                 outcome.replaced.push(name.clone());
             }
             outcome.added.push(name);
@@ -175,7 +253,8 @@ impl FileList {
         let mut outcome = AddOutcome::default();
         match stat.kind {
             EntryKind::File => {
-                self.record(source.clone(), stat.size, &mut outcome);
+                let identity = self.read_identity(store, source, &name_of(source)).await;
+                self.record(source.clone(), stat.size, identity, &mut outcome);
             }
             EntryKind::Dir => {
                 self.scan_dir(store, source, &mut outcome, true).await?;
@@ -214,10 +293,11 @@ impl FileList {
             let child = dir.join(&entry.name);
             match entry.kind {
                 EntryKind::Dir => stack.push(child),
-                EntryKind::File if has_target_ext(Path::new(&entry.name)) => {
-                    self.record(child, entry.size, outcome);
+                EntryKind::File if self.filters.accepts(&entry.name) => {
+                    let identity = self.read_identity(store, &child, &entry.name).await;
+                    self.record(child, entry.size, identity, outcome);
                 }
-                EntryKind::File => {}
+                EntryKind::File => outcome.rejected += 1,
             }
         }
         for sub in stack {
@@ -252,8 +332,9 @@ impl FileList {
         self.files.get(name)
     }
 
-    pub fn names(&self) -> impl Iterator<Item = &String> {
-        self.files.keys()
+    /// The entries' names, in the order the list holds them.
+    pub fn names(&self) -> impl Iterator<Item = &str> {
+        self.files.keys().map(String::as_str)
     }
 
     pub fn iter(&self) -> impl Iterator<Item = (&String, &FileEntry)> {
@@ -266,92 +347,295 @@ fn file_size(path: &Path) -> u64 {
     std::fs::metadata(path).map(|meta| meta.len()).unwrap_or(0)
 }
 
-/// Whether the path's extension is one of the Switch title formats, case-insensitively.
-fn has_target_ext(path: &Path) -> bool {
-    matches!(
-        path.extension()
-            .and_then(|e| e.to_str())
-            .map(|e| e.to_ascii_lowercase())
-            .as_deref(),
-        Some("nsp") | Some("nsz")
-    )
+/// The file name of a source: the last component of its path.
+fn name_of(source: &Source) -> String {
+    source.file_name().unwrap_or_default()
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::metadata::ContentType;
+    use crate::source::local::LocalStore;
     use std::fs;
 
-    #[test]
-    fn add_file_inserts_by_name() {
+    #[tokio::test]
+    async fn add_file_inserts_by_name() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("x.nsp");
         fs::write(&f, b"data").unwrap();
         let mut list = FileList::new();
-        list.add_path(&f).unwrap();
+        list.add_path(&f, &LocalStore::new()).await.unwrap();
         assert_eq!(list.len(), 1);
         assert!(list.get("x.nsp").is_some());
     }
 
-    #[test]
-    fn add_dir_recurses_into_nested_subdirectories() {
+    #[tokio::test]
+    async fn the_default_filters_accept_nsp_and_nsz() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("GAME.NSP"), b"a").unwrap();
+        fs::write(dir.path().join("Patch.NsZ"), b"b").unwrap();
+        fs::write(dir.path().join("notes.txt"), b"c").unwrap();
+        let mut list = FileList::new();
+        list.add_path(dir.path(), &LocalStore::new()).await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list.get("GAME.NSP").is_some());
+        assert!(list.get("Patch.NsZ").is_some());
+        assert!(list.get("notes.txt").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_configured_filter_set_changes_what_the_local_walk_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.nsp"), b"a").unwrap();
+        fs::write(dir.path().join("b.nsz"), b"b").unwrap();
+        let mut list = FileList::with_filters(Filters::with_extensions(["nsz"]));
+        list.add_path(dir.path(), &LocalStore::new()).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list.get("b.nsz").is_some());
+        assert!(list.get("a.nsp").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_configured_exclude_pattern_changes_what_the_local_walk_accepts() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("Game.nsp"), b"a").unwrap();
+        fs::write(dir.path().join("Old.nsp"), b"b").unwrap();
+        let mut filters = Filters::new();
+        filters.add_exclude("Old*").unwrap();
+        let mut list = FileList::with_filters(filters);
+        list.add_path(dir.path(), &LocalStore::new()).await.unwrap();
+        assert_eq!(list.len(), 1);
+        assert!(list.get("Game.nsp").is_some());
+        assert!(list.get("Old.nsp").is_none());
+    }
+
+    #[tokio::test]
+    async fn a_directly_added_file_ignores_the_filters() {
+        let dir = tempfile::tempdir().unwrap();
+        let readme = dir.path().join("readme.txt");
+        fs::write(&readme, b"a").unwrap();
+        let old = dir.path().join("Old.nsp");
+        fs::write(&old, b"b").unwrap();
+        let mut filters = Filters::new();
+        filters.add_exclude("Old*").unwrap();
+        let mut list = FileList::with_filters(filters);
+        list.add_path(&readme, &LocalStore::new()).await.unwrap();
+        list.add_path(&old, &LocalStore::new()).await.unwrap();
+        assert_eq!(list.len(), 2);
+        assert!(list.get("readme.txt").is_some());
+        assert!(list.get("Old.nsp").is_some());
+    }
+
+    #[tokio::test]
+    async fn a_scan_reports_the_files_the_filters_rejected() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("a.nsp"), b"a").unwrap();
+        fs::write(dir.path().join("b.nsz"), b"b").unwrap();
+        fs::write(dir.path().join("notes.txt"), b"c").unwrap();
+        fs::write(dir.path().join("cover.jpg"), b"d").unwrap();
+        fs::write(dir.path().join("readme.md"), b"e").unwrap();
+        let mut list = FileList::new();
+        let outcome = list.add_path(dir.path(), &LocalStore::new()).await.unwrap();
+        assert_eq!(outcome.added.len(), 2);
+        assert_eq!(outcome.rejected, 3);
+    }
+
+    #[tokio::test]
+    async fn a_scan_that_rejects_everything_reports_no_accepted_file() {
+        let dir = tempfile::tempdir().unwrap();
+        fs::write(dir.path().join("notes.txt"), b"c").unwrap();
+        fs::write(dir.path().join("cover.jpg"), b"d").unwrap();
+        let mut list = FileList::new();
+        let outcome = list.add_path(dir.path(), &LocalStore::new()).await.unwrap();
+        assert!(outcome.added.is_empty());
+        assert_eq!(outcome.rejected, 2);
+    }
+
+    /// A store that records the files it was asked to open, and can be told
+    /// to fail every open.
+    struct RecordingStore {
+        inner: LocalStore,
+        opened: std::sync::Mutex<Vec<String>>,
+        fail: bool,
+    }
+
+    impl RecordingStore {
+        fn new() -> Self {
+            Self {
+                inner: LocalStore::new(),
+                opened: std::sync::Mutex::new(Vec::new()),
+                fail: false,
+            }
+        }
+
+        fn failing() -> Self {
+            Self {
+                fail: true,
+                ..Self::new()
+            }
+        }
+
+        fn opened(&self) -> Vec<String> {
+            self.opened.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Sources for RecordingStore {
+        async fn open(
+            &self,
+            source: &Source,
+        ) -> Result<Box<dyn crate::source::FileHandle>, SourceError> {
+            self.opened.lock().unwrap().push(source.to_string());
+            if self.fail {
+                return Err(SourceError::new("cannot open"));
+            }
+            self.inner.open(source).await
+        }
+
+        async fn list_dir(
+            &self,
+            source: &Source,
+        ) -> Result<Vec<crate::source::ListEntry>, SourceError> {
+            self.inner.list_dir(source).await
+        }
+
+        async fn stat(
+            &self,
+            source: &Source,
+        ) -> Result<Option<crate::source::ListEntry>, SourceError> {
+            self.inner.stat(source).await
+        }
+    }
+
+    #[tokio::test]
+    async fn a_file_carries_the_identity_its_name_holds() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("Game [0100000000010000].nsp");
+        fs::write(&path, b"not a container").unwrap();
+
+        let mut list = FileList::new();
+        list.add_path(&path, &LocalStore::new()).await.unwrap();
+
+        let entry = list.get("Game [0100000000010000].nsp").unwrap();
+        assert_eq!(entry.identity.title_id.as_deref(), Some("0100000000010000"));
+        assert_eq!(entry.identity.content_type, Some(ContentType::Base));
+        assert_eq!(entry.identity.name.as_deref(), Some("Game"));
+    }
+
+    #[tokio::test]
+    async fn the_identity_is_read_through_the_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.nsp");
+        fs::write(&path, b"not a container").unwrap();
+        let store = RecordingStore::new();
+
+        let mut list = FileList::new();
+        list.add_path(&path, &store).await.unwrap();
+
+        assert_eq!(
+            store.opened(),
+            vec![format!("{}", path.display())],
+            "the store was asked to open the file"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_file_that_cannot_be_read_for_its_identity_is_still_added() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("game.nsp");
+        fs::write(&path, b"not a container").unwrap();
+        let store = RecordingStore::failing();
+
+        let mut list = FileList::new();
+        let outcome = list.add_path(&path, &store).await.unwrap();
+
+        assert_eq!(list.len(), 1, "the file is still offered");
+        assert!(
+            list.get("game.nsp").unwrap().identity.is_empty(),
+            "it carries no identity"
+        );
+        assert!(outcome.skipped.is_empty(), "no path is reported as skipped");
+    }
+
+    #[tokio::test]
+    async fn a_file_that_is_not_a_container_is_not_read() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("notes.txt");
+        fs::write(&path, b"hello").unwrap();
+        let store = RecordingStore::new();
+
+        let mut list = FileList::new();
+        list.add_path(&path, &store).await.unwrap();
+
+        assert_eq!(list.len(), 1);
+        assert!(
+            store.opened().is_empty(),
+            "the file's contents are not read: {:?}",
+            store.opened()
+        );
+    }
+
+    #[tokio::test]
+    async fn add_dir_recurses_into_nested_subdirectories() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.nsp"), b"a").unwrap();
         let sub = dir.path().join("sub").join("deep");
         fs::create_dir_all(&sub).unwrap();
         fs::write(sub.join("b.nsz"), b"b").unwrap();
         let mut list = FileList::new();
-        list.add_path(dir.path()).unwrap();
+        list.add_path(dir.path(), &LocalStore::new()).await.unwrap();
         assert_eq!(list.len(), 2);
         assert!(list.get("a.nsp").is_some());
         assert!(list.get("b.nsz").is_some());
     }
 
-    #[test]
-    fn add_dir_skips_non_matching_extensions() {
+    #[tokio::test]
+    async fn add_dir_skips_non_matching_extensions() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("game.nsp"), b"g").unwrap();
         fs::write(dir.path().join("notes.txt"), b"n").unwrap();
         fs::write(dir.path().join("cover.jpg"), b"c").unwrap();
         let mut list = FileList::new();
-        list.add_path(dir.path()).unwrap();
+        list.add_path(dir.path(), &LocalStore::new()).await.unwrap();
         assert_eq!(list.len(), 1);
         assert!(list.get("game.nsp").is_some());
     }
 
-    #[test]
-    fn add_dir_matches_extensions_case_insensitively() {
+    #[tokio::test]
+    async fn add_dir_matches_extensions_case_insensitively() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("GAME.NSP"), b"g").unwrap();
         fs::write(dir.path().join("Patch.NsZ"), b"p").unwrap();
         let mut list = FileList::new();
-        list.add_path(dir.path()).unwrap();
+        list.add_path(dir.path(), &LocalStore::new()).await.unwrap();
         assert_eq!(list.len(), 2);
         assert!(list.get("GAME.NSP").is_some());
         assert!(list.get("Patch.NsZ").is_some());
     }
 
-    #[test]
-    fn add_file_is_not_extension_filtered() {
+    #[tokio::test]
+    async fn add_file_is_not_extension_filtered() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("readme.txt");
         fs::write(&f, b"r").unwrap();
         let mut list = FileList::new();
-        list.add_path(&f).unwrap();
+        list.add_path(&f, &LocalStore::new()).await.unwrap();
         assert_eq!(list.len(), 1);
         assert!(list.get("readme.txt").is_some());
     }
 
-    #[test]
-    fn add_empty_dir_adds_nothing() {
+    #[tokio::test]
+    async fn add_empty_dir_adds_nothing() {
         let dir = tempfile::tempdir().unwrap();
         let mut list = FileList::new();
-        list.add_path(dir.path()).unwrap();
+        list.add_path(dir.path(), &LocalStore::new()).await.unwrap();
         assert!(list.is_empty());
     }
 
-    #[test]
-    fn insert_overwrites_same_name() {
+    #[tokio::test]
+    async fn insert_overwrites_same_name() {
         let mut list = FileList::new();
         list.insert("a", "/1");
         list.insert("a", "/2");
@@ -359,8 +643,8 @@ mod tests {
         assert_eq!(list.get("a").unwrap().source.to_string(), "/2");
     }
 
-    #[test]
-    fn insert_returns_the_replaced_source() {
+    #[tokio::test]
+    async fn insert_returns_the_replaced_source() {
         let mut list = FileList::new();
         assert_eq!(list.insert("a", "/1"), None);
         assert_eq!(
@@ -369,66 +653,66 @@ mod tests {
         );
     }
 
-    #[test]
-    fn add_path_reports_replaced_name() {
+    #[tokio::test]
+    async fn add_path_reports_replaced_name() {
         let one = tempfile::tempdir().unwrap();
         let two = tempfile::tempdir().unwrap();
         fs::write(one.path().join("game.nsp"), b"1").unwrap();
         fs::write(two.path().join("game.nsp"), b"2").unwrap();
 
         let mut list = FileList::new();
-        list.add_path(one.path()).unwrap();
-        let outcome = list.add_path(two.path()).unwrap();
+        list.add_path(one.path(), &LocalStore::new()).await.unwrap();
+        let outcome = list.add_path(two.path(), &LocalStore::new()).await.unwrap();
 
         assert_eq!(outcome.replaced, vec!["game.nsp".to_string()]);
         assert_eq!(list.len(), 1);
     }
 
-    #[test]
-    fn add_path_reports_added_names() {
+    #[tokio::test]
+    async fn add_path_reports_added_names() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.nsp"), b"a").unwrap();
 
         let mut list = FileList::new();
-        let outcome = list.add_path(dir.path()).unwrap();
+        let outcome = list.add_path(dir.path(), &LocalStore::new()).await.unwrap();
 
         assert_eq!(outcome.added, vec!["a.nsp".to_string()]);
         assert!(outcome.skipped.is_empty());
     }
 
-    #[test]
-    fn add_file_records_size() {
+    #[tokio::test]
+    async fn add_file_records_size() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("x.nsp");
         fs::write(&f, b"12345").unwrap();
         let mut list = FileList::new();
-        list.add_path(&f).unwrap();
+        list.add_path(&f, &LocalStore::new()).await.unwrap();
         assert_eq!(list.get("x.nsp").unwrap().size, 5);
     }
 
-    #[test]
-    fn recorded_size_survives_the_file_being_removed() {
+    #[tokio::test]
+    async fn recorded_size_survives_the_file_being_removed() {
         let dir = tempfile::tempdir().unwrap();
         let f = dir.path().join("x.nsp");
         fs::write(&f, b"1234567").unwrap();
         let mut list = FileList::new();
-        list.add_path(&f).unwrap();
+        list.add_path(&f, &LocalStore::new()).await.unwrap();
         fs::remove_file(&f).unwrap();
         assert_eq!(list.get("x.nsp").unwrap().size, 7);
     }
 
-    #[test]
-    fn total_size_sums_entries() {
+    #[tokio::test]
+    async fn total_size_sums_entries() {
         let dir = tempfile::tempdir().unwrap();
         fs::write(dir.path().join("a.nsp"), b"abc").unwrap();
         fs::write(dir.path().join("b.nsp"), b"defg").unwrap();
         let mut list = FileList::new();
-        list.add_path(dir.path()).unwrap();
+        list.add_path(dir.path(), &LocalStore::new()).await.unwrap();
         assert_eq!(list.total_size(), 7);
     }
 
-    #[test]
-    fn remove_drops_an_entry() {
+    #[tokio::test]
+    async fn remove_drops_an_entry() {
         let mut list = FileList::new();
         list.insert("a", "/1");
         assert!(list.remove("a").is_some());
@@ -437,8 +721,8 @@ mod tests {
     }
 
     #[cfg(unix)]
-    #[test]
-    fn add_dir_skips_unreadable_subdirectory() {
+    #[tokio::test]
+    async fn add_dir_skips_unreadable_subdirectory() {
         use std::os::unix::fs::PermissionsExt;
 
         let dir = tempfile::tempdir().unwrap();
@@ -449,7 +733,7 @@ mod tests {
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o000)).unwrap();
 
         let mut list = FileList::new();
-        let outcome = list.add_path(dir.path()).unwrap();
+        let outcome = list.add_path(dir.path(), &LocalStore::new()).await.unwrap();
 
         // Restore permissions so the tempdir can be cleaned up.
         fs::set_permissions(&locked, fs::Permissions::from_mode(0o755)).unwrap();
@@ -464,7 +748,7 @@ mod tests {
 
     /// Tests for [`FileList::add_source`], running against [`MemStore`] and a
     /// small wrapper that can deny listings like an unreadable share directory.
-    #[cfg(feature = "test-util")]
+    #[cfg(test)]
     mod add_source_tests {
         use super::*;
         use crate::source::local::LocalStore;
@@ -545,6 +829,38 @@ mod tests {
 
             assert_eq!(outcome.added, vec!["game.nsp".to_string()]);
             assert!(list.get("README.TXT").is_none());
+        }
+
+        #[tokio::test]
+        async fn add_source_applies_the_configured_filters() {
+            let store = MemStore::new();
+            store.add_file(&smb("nas", "archive/a.nsp"), b"x" as &[u8]);
+            store.add_file(&smb("nas", "archive/b.nsz"), b"y" as &[u8]);
+
+            let mut list = FileList::with_filters(Filters::with_extensions(["nsz"]));
+            list.add_source(&store, &smb("nas", "archive"))
+                .await
+                .unwrap();
+
+            assert_eq!(list.len(), 1);
+            assert!(list.get("b.nsz").is_some());
+            assert!(list.get("a.nsp").is_none());
+        }
+
+        #[tokio::test]
+        async fn add_source_reports_the_files_the_filters_rejected() {
+            let store = MemStore::new();
+            store.add_file(&smb("nas", "archive/a.nsp"), b"x" as &[u8]);
+            store.add_file(&smb("nas", "archive/notes.txt"), b"y" as &[u8]);
+
+            let mut list = FileList::new();
+            let outcome = list
+                .add_source(&store, &smb("nas", "archive"))
+                .await
+                .unwrap();
+
+            assert_eq!(outcome.added.len(), 1);
+            assert_eq!(outcome.rejected, 1);
         }
 
         #[tokio::test]

@@ -25,11 +25,58 @@ dbi-backend game1.nsp game2.nsp
 ```
 
 Keys: `a` open the path picker, `c` clear the list, `s` start the server, `S`
-browse network shares, `q` quit. While the server is running, `a`, `c`, and `S`
-are disabled so the offered list matches the running server's snapshot. In the
-picker: `j`/`k` or the arrow keys move, `Enter` opens a directory or adds a
-file, `Space` adds the highlighted directory or file, `Backspace` goes up, and
-`Esc`/`q` cancels.
+browse network shares, `/` search the list, `q` quit. While the server is
+running, `a`, `c`, and `S` are disabled so the offered list matches the
+running server's snapshot. In the picker: `j`/`k` or the arrow keys move,
+`Enter` opens a directory or adds a file, `Space` adds the highlighted directory
+or file, `Backspace` goes up, and `Esc`/`q` cancels.
+
+## Titles
+
+The file list shows what each offered file is: its title id, the kind of
+content it is (`base`, `update` or `dlc`) and its version. The title id and the
+version come from the container's own metadata when the container carries it in
+the clear; otherwise they are read from the conventional dump name
+`Name [0100000000010000][v65536].nsp`. A title id that is not in the name is
+classified by its last three digits: `000` is a base game, `800` an update,
+anything else downloadable content.
+
+The title's *name* is never read out of the container. Nintendo keeps it in the
+content archive's header, which is encrypted with a key only the console holds,
+so the backend shows the name the file already carries instead of asking for
+console keys. The files offered to the Switch keep their names whatever the
+backend knows about them.
+
+## Filters
+
+A directory scan offers only the files it accepts: by default every `.nsp` and
+`.nsz` file. Change that from the command line or from the config file:
+
+```bash
+# Offer only .xci and .nsp files
+dbi-backend --ext xci --ext nsp ~/games
+
+# Offer everything except the patched copies
+dbi-backend --exclude '*PATCH*' ~/games
+```
+
+```toml
+[filters]
+extensions = ["nsp", "nsz"]
+include = ["*.nsp"]
+exclude = ["*PATCH*"]
+```
+
+The command line wins over the config file, per setting: `--ext` overrides
+`extensions` while the config file's `exclude` still applies. A pattern is a
+glob matched against the *file name* (not the path), ignoring case; a bracket
+introduces a character class, so `*[PATCH]*` matches any name holding a `P`,
+an `A`, a `T`, a `C` or an `H`. The filters apply when a path is added, not to
+what the picker lists, and a file named explicitly is always added.
+
+The `/` key searches the offered list: typing narrows the rows the file list
+shows, `Enter` keeps the search and closes the input, `Esc` clears it. The
+search never changes what the Switch receives — it is a view, not a filter.
 
 ## Share browsing
 

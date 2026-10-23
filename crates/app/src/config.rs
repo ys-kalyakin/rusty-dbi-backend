@@ -12,11 +12,30 @@ use std::path::{Path, PathBuf};
 
 pub use dbi_backend_core::source::smb::ShareConfig;
 
+/// The port an SMB share speaks on when its `server` names none.
+const DEFAULT_SMB_PORT: u16 = 445;
+
 /// The configuration file's `[[shares]]` entries.
 #[derive(Deserialize, Default)]
 struct ConfigFile {
     #[serde(default)]
     shares: Vec<toml::Table>,
+    /// The `[filters]` section: which files a scan accepts.
+    #[serde(default)]
+    filters: Option<toml::Table>,
+}
+
+/// The filter settings one source asks for — the command line or the config
+/// file. A setting the source says nothing about is unset; an empty list means
+/// the source asked for nothing, not that it asked for the default.
+#[derive(Debug, Default, Clone, PartialEq, Eq)]
+pub struct FilterSettings {
+    /// The accepted extensions, when the source names a set.
+    pub extensions: Option<Vec<String>>,
+    /// The include patterns.
+    pub include: Vec<String>,
+    /// The exclude patterns.
+    pub exclude: Vec<String>,
 }
 
 /// Configuration plus everything the app should warn about: malformed or
@@ -24,6 +43,7 @@ struct ConfigFile {
 #[derive(Debug, Default, PartialEq, Eq)]
 pub struct LoadedConfig {
     pub shares: Vec<ShareConfig>,
+    pub filters: FilterSettings,
     pub warnings: Vec<String>,
 }
 
@@ -49,22 +69,16 @@ fn parse_share(entry: &toml::Table) -> Result<ShareConfig, String> {
     };
     let root = match entry.get("root") {
         None => String::new(),
-        Some(toml::Value::String(value)) => value.trim_matches('/').to_string(),
+        Some(toml::Value::String(value)) => value.clone(),
         Some(_) => return Err("root must be a string".to_string()),
     };
     let (host, port) = parse_server(&server)?;
-    Ok(ShareConfig {
-        name,
-        host,
-        port,
-        share,
-        username,
-        domain,
-        root,
-    })
+    Ok(share_from_parts(
+        name, host, port, share, username, domain, &root,
+    ))
 }
 
-/// `host` defaults to port 445; `host:port` pins another one.
+/// `host` defaults to the SMB port; `host:port` pins another one.
 fn parse_server(server: &str) -> Result<(String, u16), String> {
     match server.rsplit_once(':') {
         Some((host, port)) => {
@@ -73,7 +87,31 @@ fn parse_server(server: &str) -> Result<(String, u16), String> {
                 .map_err(|_| format!("bad port in server {server:?}"))?;
             Ok((host.to_string(), port))
         }
-        None => Ok((server.to_string(), 445)),
+        None => Ok((server.to_string(), DEFAULT_SMB_PORT)),
+    }
+}
+
+/// The one place the share's fields take their shape: the required fields as
+/// given, the domain as the caller normalised it, and the root without its
+/// surrounding slashes. Both ways a share starts life — the config file and
+/// the add-share form — come through here, so neither can drift.
+fn share_from_parts(
+    name: String,
+    host: String,
+    port: u16,
+    share: String,
+    username: String,
+    domain: Option<String>,
+    root: &str,
+) -> ShareConfig {
+    ShareConfig {
+        name,
+        host,
+        port,
+        share,
+        username,
+        domain,
+        root: root.trim_matches('/').to_string(),
     }
 }
 
@@ -110,13 +148,13 @@ pub fn build_share(
     // The port parse is only tried once the server is present; a missing
     // server is already on the list.
     let (host, port) = if server.is_empty() {
-        (String::new(), 445)
+        (String::new(), DEFAULT_SMB_PORT)
     } else {
         match parse_server(server) {
             Ok(parts) => parts,
             Err(e) => {
                 errors.push(e);
-                (String::new(), 445)
+                (String::new(), DEFAULT_SMB_PORT)
             }
         }
     };
@@ -126,15 +164,15 @@ pub fn build_share(
         Some(domain.to_string())
     };
     if errors.is_empty() {
-        Ok(ShareConfig {
-            name: name.to_string(),
+        Ok(share_from_parts(
+            name.to_string(),
             host,
             port,
-            share: share.to_string(),
-            username: username.to_string(),
+            share.to_string(),
+            username.to_string(),
             domain,
-            root: root.trim_matches('/').to_string(),
-        })
+            root,
+        ))
     } else {
         Err(errors)
     }
@@ -176,7 +214,51 @@ pub fn parse_contents(contents: &str) -> LoadedConfig {
             }
         }
     }
+    if let Some(table) = &file.filters {
+        loaded.filters = parse_filters(table, &mut loaded.warnings);
+    }
     loaded
+}
+
+/// Read the `[filters]` section: the accepted extensions, the include
+/// patterns and the exclude patterns. A malformed key is reported and leaves
+/// that one setting unset; the section's other keys are still read.
+fn parse_filters(table: &toml::Table, warnings: &mut Vec<String>) -> FilterSettings {
+    let mut settings = FilterSettings::default();
+    if let Some(value) = table.get("extensions") {
+        match string_list(value) {
+            Ok(list) if !list.is_empty() => settings.extensions = Some(list),
+            Ok(_) => {}
+            Err(e) => warnings.push(format!("config: filters: extensions {e}")),
+        }
+    }
+    for (key, target) in [
+        ("include", &mut settings.include),
+        ("exclude", &mut settings.exclude),
+    ] {
+        if let Some(value) = table.get(key) {
+            match string_list(value) {
+                Ok(list) => *target = list,
+                Err(e) => warnings.push(format!("config: filters: {key} {e}")),
+            }
+        }
+    }
+    settings
+}
+
+/// The strings of a TOML array, or why the value is not one.
+fn string_list(value: &toml::Value) -> Result<Vec<String>, String> {
+    let array = value
+        .as_array()
+        .ok_or_else(|| "must be a list of strings".to_string())?;
+    array
+        .iter()
+        .map(|item| {
+            item.as_str()
+                .map(str::to_string)
+                .ok_or_else(|| "must be a list of strings".to_string())
+        })
+        .collect()
 }
 
 /// The default config path: `<config dir>/dbi-backend/config.toml`.
@@ -187,7 +269,7 @@ pub fn config_path() -> Option<PathBuf> {
 /// A configured share's `server` value in the file's dialect: `host` when the
 /// port is the SMB default, `host:port` otherwise.
 fn server_string(config: &ShareConfig) -> String {
-    if config.port == 445 {
+    if config.port == DEFAULT_SMB_PORT {
         config.host.clone()
     } else {
         format!("{}:{}", config.host, config.port)
@@ -257,6 +339,7 @@ impl LoadedConfig {
             Ok(contents) => parse_contents(&contents),
             Err(e) => LoadedConfig {
                 shares: Vec::new(),
+                filters: FilterSettings::default(),
                 warnings: vec![format!("cannot read {}: {e}", path.display())],
             },
         }
@@ -280,16 +363,48 @@ pub fn load_user_config() -> LoadedConfig {
 mod tests {
     use super::*;
 
-    #[test]
-    fn the_readme_share_snippet_parses() {
-        // The README's `toml` block is documentation of the real format: it
-        // must stay a valid, warning-free input for the loader.
+    /// The `toml` blocks the README shows, in the order they appear.
+    fn readme_toml_blocks() -> Vec<String> {
         let readme =
             std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/../../README.md"))
                 .unwrap();
-        let start = readme.find("```toml").unwrap() + "```toml".len();
-        let end = start + readme[start..].find("```").unwrap();
-        let loaded = parse_contents(&readme[start..end]);
+        let mut blocks = Vec::new();
+        let mut rest = readme.as_str();
+        while let Some(start) = rest.find("```toml") {
+            let body = &rest[start + "```toml".len()..];
+            let end = body.find("```").unwrap();
+            blocks.push(body[..end].to_string());
+            rest = &body[end..];
+        }
+        blocks
+    }
+
+    #[test]
+    fn the_readme_snippets_parse() {
+        // The README's `toml` blocks are documentation of the real format:
+        // they must stay valid, warning-free input for the loader.
+        let blocks = readme_toml_blocks();
+        assert!(blocks.len() >= 2, "the README documents both sections");
+        for block in &blocks {
+            let loaded = parse_contents(block);
+            assert_eq!(
+                loaded.warnings,
+                Vec::<String>::new(),
+                "the block parses without a warning: {block}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_readme_share_snippet_parses() {
+        // The README's share block is documentation of the real format: it
+        // must stay a valid, warning-free input for the loader.
+        let blocks = readme_toml_blocks();
+        let block = blocks
+            .iter()
+            .find(|block| block.contains("[[shares]]"))
+            .expect("the README documents a share");
+        let loaded = parse_contents(block);
 
         assert_eq!(loaded.warnings, Vec::<String>::new());
         assert_eq!(loaded.shares.len(), 1);
@@ -301,6 +416,24 @@ mod tests {
         assert_eq!(share.username, "you");
         assert_eq!(share.domain, None);
         assert_eq!(share.root, "");
+    }
+
+    #[test]
+    fn the_readme_filters_snippet_parses() {
+        let blocks = readme_toml_blocks();
+        let block = blocks
+            .iter()
+            .find(|block| block.contains("[filters]"))
+            .expect("the README documents the filters section");
+        let loaded = parse_contents(block);
+
+        assert_eq!(loaded.warnings, Vec::<String>::new());
+        assert_eq!(
+            loaded.filters.extensions,
+            Some(vec!["nsp".to_string(), "nsz".to_string()])
+        );
+        assert_eq!(loaded.filters.include, vec!["*.nsp".to_string()]);
+        assert_eq!(loaded.filters.exclude, vec!["*PATCH*".to_string()]);
     }
 
     fn config(contents: &str) -> LoadedConfig {
@@ -592,6 +725,25 @@ mod tests {
     }
 
     #[test]
+    fn a_save_keeps_the_filters_section() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("config.toml");
+        std::fs::write(
+            &path,
+            "[filters]\nextensions = [\"nsp\"]\ninclude = [\"*.nsp\"]\n",
+        )
+        .unwrap();
+
+        save_shares(&[share("Nas")], &path).unwrap();
+
+        let loaded = parse_contents(&std::fs::read_to_string(&path).unwrap());
+        assert_eq!(loaded.warnings, Vec::<String>::new());
+        assert_eq!(loaded.filters.extensions, Some(vec!["nsp".to_string()]));
+        assert_eq!(loaded.filters.include, vec!["*.nsp".to_string()]);
+        assert_eq!(share_names_in_order(&loaded.shares), vec!["Nas"]);
+    }
+
+    #[test]
     fn a_failed_save_leaves_the_file_unchanged() {
         let dir = tempfile::tempdir().unwrap();
         let path = dir.path().join("config.toml");
@@ -612,5 +764,53 @@ mod tests {
             std::fs::read_to_string(&unreachable).is_err(),
             "no half-written file appears"
         );
+    }
+
+    #[test]
+    fn reads_the_filters_section() {
+        let loaded = config(
+            "[filters]\nextensions = [\"nsp\", \"nsz\"]\ninclude = [\"*.nsp\"]\nexclude = [\"*PATCH*\"]\n",
+        );
+        assert_eq!(loaded.warnings, Vec::<String>::new());
+        assert_eq!(
+            loaded.filters.extensions,
+            Some(vec!["nsp".to_string(), "nsz".to_string()])
+        );
+        assert_eq!(loaded.filters.include, vec!["*.nsp".to_string()]);
+        assert_eq!(loaded.filters.exclude, vec!["*PATCH*".to_string()]);
+    }
+
+    #[test]
+    fn a_malformed_filters_entry_warns_and_keeps_the_rest() {
+        let loaded = config(
+            "[[shares]]\nname = \"nas\"\nserver = \"192.0.2.4\"\nshare = \"games\"\nusername = \"you\"\n\n\
+             [filters]\nextensions = \"nsp\"\ninclude = [\"*.nsp\"]\n",
+        );
+        assert_eq!(loaded.shares.len(), 1, "the share is still listed");
+        assert_eq!(loaded.filters.extensions, None, "the bad setting is unset");
+        assert_eq!(
+            loaded.filters.include,
+            vec!["*.nsp".to_string()],
+            "the section's other keys are still read"
+        );
+        assert_eq!(loaded.warnings.len(), 1, "the malformed entry is reported");
+    }
+
+    #[test]
+    fn a_file_without_the_filters_section_asks_for_nothing() {
+        let loaded = config(
+            "[[shares]]\nname = \"nas\"\nserver = \"192.0.2.4\"\nshare = \"games\"\nusername = \"you\"\n",
+        );
+        assert_eq!(loaded.warnings, Vec::<String>::new());
+        assert_eq!(loaded.filters.extensions, None);
+        assert!(loaded.filters.include.is_empty());
+        assert!(loaded.filters.exclude.is_empty());
+    }
+
+    #[test]
+    fn an_empty_filters_section_asks_for_nothing() {
+        let loaded = config("[filters]\nextensions = []\n");
+        assert_eq!(loaded.warnings, Vec::<String>::new());
+        assert_eq!(loaded.filters.extensions, None);
     }
 }

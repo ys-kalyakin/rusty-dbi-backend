@@ -10,7 +10,9 @@ lifecycle that together form the user-facing behavior of the backend.
 ### Requirement: Command-line paths
 
 The program SHALL accept zero or more positional `PATH` arguments, each a file or
-directory to offer, and SHALL reject unknown flags.
+directory to offer, SHALL accept the filter options that configure the accepted
+extension set and the include and exclude patterns, and SHALL reject unknown
+flags.
 
 #### Scenario: Multiple paths are accepted
 
@@ -21,6 +23,11 @@ directory to offer, and SHALL reject unknown flags.
 
 - **WHEN** invoked with an unrecognized option
 - **THEN** argument parsing fails
+
+#### Scenario: Filter options are accepted
+
+- **WHEN** invoked with an accepted extension set, an include pattern, and an exclude pattern
+- **THEN** the options are parsed and become the filter settings in effect
 
 ### Requirement: Startup path loading
 
@@ -63,7 +70,7 @@ The UI SHALL show a status/header region, a file list region, a log region cappe
 
 ### Requirement: Keybindings
 
-Outside the picker the UI SHALL map `a` to open the path picker, `c` to clear the list, `d` to remove the highlighted file, `s` to start the server only when the list is non-empty and no server is running, `?` to toggle help, `j`/`k` and the arrow keys to move the highlight, and `q` to quit. While the server task is active, `a`, `c`, and `d` SHALL be inert so the offered list matches the server's snapshot, and the UI SHALL visibly mark those actions as unavailable. While the picker is open, keys SHALL drive the picker instead of these actions.
+Outside the picker the UI SHALL map `a` to open the path picker, `c` to clear the list, `d` to remove the highlighted file, `s` to start the server only when the list is non-empty and no server is running, `/` to open the file list's search, `?` to toggle help, `j`/`k` and the arrow keys to move the highlight, and `q` to quit. While the server task is active, `a`, `c`, and `d` SHALL be inert so the offered list matches the server's snapshot, and the UI SHALL visibly mark those actions as unavailable. While the picker is open, keys SHALL drive the picker instead of these actions. While the search input is open, keys SHALL drive the search instead of these actions.
 
 #### Scenario: Quit key requests exit
 
@@ -104,6 +111,16 @@ Outside the picker the UI SHALL map `a` to open the path picker, `c` to clear th
 
 - **WHEN** the picker is open and a key that is a global action is pressed
 - **THEN** the key is interpreted by the picker and does not trigger the global action
+
+#### Scenario: The open search takes the keys
+
+- **WHEN** the search input is open and a printable key is pressed
+- **THEN** the key goes into the search and triggers no global action
+
+#### Scenario: The search is closed before the editing keys act again
+
+- **WHEN** the search input is open and Enter is pressed
+- **THEN** the search input closes, the search stays, and the editing keys act again
 
 ### Requirement: Background server lifecycle
 
@@ -487,3 +504,58 @@ connect to the share or ask for a password.
 
 - **WHEN** the form is submitted with valid data
 - **THEN** no connection is attempted and no password is asked
+
+### Requirement: The file list can be searched
+
+The UI SHALL let the user narrow the file list with a search string, matched
+against the file names case-insensitively, and SHALL show only the matching
+files while a search is active. The search SHALL NOT change the files offered
+to the Switch: the list the server hands over keeps every file the scan
+accepted. While the picker is open, the search key SHALL drive the picker
+instead.
+
+#### Scenario: A search narrows the visible list
+
+- **WHEN** a search string is entered in the file list
+- **THEN** only the files whose name contains that string, ignoring case, are shown
+
+#### Scenario: A search with no matches shows an empty list
+
+- **WHEN** a search string matches no file
+- **THEN** no file is shown and no file is highlighted
+
+#### Scenario: Clearing the search restores the full list
+
+- **WHEN** the search is cleared
+- **THEN** every file of the list is shown again
+
+#### Scenario: The search does not change what the Switch receives
+
+- **WHEN** a search is active and the server starts
+- **THEN** the list offered to the Switch contains every file the scan accepted, not only the matching ones
+
+#### Scenario: The search works while the server runs
+
+- **WHEN** the server task is active
+- **THEN** a search can still be entered and cleared, and the editing keys stay unavailable
+
+#### Scenario: The picker takes the search key
+
+- **WHEN** the picker is open and the search key is pressed
+- **THEN** the picker handles the key and the file list's search is not started
+
+### Requirement: The file list shows the title identity
+
+The file list SHALL show, next to each file that has an identity, its title
+id, its content type and its version, and SHALL show the file's name alone for
+a file without an identity.
+
+#### Scenario: The identity is shown next to the name
+
+- **WHEN** a file with a title id, a content type and a version is listed
+- **THEN** the list shows that title id, that content type and that version next to the file's name
+
+#### Scenario: A file without an identity shows only its name
+
+- **WHEN** a file without an identity is listed
+- **THEN** the list shows the file's name and no title id, content type or version

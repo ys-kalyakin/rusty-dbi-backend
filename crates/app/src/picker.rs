@@ -5,15 +5,8 @@
 //! Either way the picker never touches the network itself: share listings
 //! travel through [`Picker::reload_request`] to the app's action loop.
 
-use dbi_backend_core::source::{ListEntry, SmbLocation, Source};
+use dbi_backend_core::source::{EntryKind, ListEntry, SmbLocation, Source};
 use std::path::{Path, PathBuf};
-
-/// What an entry points at.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Kind {
-    Dir,
-    File,
-}
 
 /// A single listing entry, carrying everything needed to add it later.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -21,7 +14,7 @@ pub struct Entry {
     pub source: Source,
     /// The display name (one path component).
     pub name: String,
-    pub kind: Kind,
+    pub kind: EntryKind,
     /// Regular files carry a size; directories do not.
     pub size: Option<u64>,
 }
@@ -132,7 +125,7 @@ impl Picker {
             let Some(kind) = classify(&path, entry.file_type()) else {
                 continue;
             };
-            let size = if kind == Kind::File {
+            let size = if kind == EntryKind::File {
                 std::fs::metadata(&path).map(|meta| meta.len()).ok()
             } else {
                 None
@@ -165,18 +158,11 @@ impl Picker {
         self.error = None;
         self.busy = false;
         for entry in entries {
-            let kind = match entry.kind {
-                dbi_backend_core::source::EntryKind::Dir => Kind::Dir,
-                dbi_backend_core::source::EntryKind::File => Kind::File,
-            };
             self.all.push(Entry {
-                source: Source::Smb(SmbLocation {
-                    share: location.share.clone(),
-                    path: join_share(&location.path, &entry.name),
-                }),
+                source: Source::Smb(location.join(&entry.name)),
                 name: entry.name,
-                kind,
-                size: (kind == Kind::File).then_some(entry.size),
+                kind: entry.kind,
+                size: (entry.kind == EntryKind::File).then_some(entry.size),
             });
         }
         self.all.sort_by(|a, b| {
@@ -220,9 +206,9 @@ impl Picker {
         }
     }
 
-    /// The location as shown: a local path, or `share: <path>`.
-    pub fn origin_display(&self) -> String {
-        self.origin.display()
+    /// The origin the picker browses right now.
+    pub fn origin(&self) -> &Origin {
+        &self.origin
     }
 
     /// The entries currently shown (the full listing when no filter is set).
@@ -301,7 +287,7 @@ impl Picker {
     /// [`Picker::reload_request`].
     pub fn descend(&mut self) {
         let Some(entry) = self.current() else { return };
-        if entry.kind != Kind::Dir {
+        if entry.kind != EntryKind::Dir {
             return;
         }
         self.set_origin(match &entry.source {
@@ -318,7 +304,7 @@ impl Picker {
             Origin::Local(path) => Origin::Local(path.parent()?.to_path_buf()),
             Origin::Share(location) => {
                 let root = &self.root_share_path;
-                let parent = parent_share_path(&location.path)?;
+                let parent = location.parent_path()?;
                 let within = root.is_empty()
                     || parent == root.as_str()
                     || parent.starts_with(&format!("{root}/"));
@@ -353,45 +339,24 @@ impl Picker {
     }
 }
 
-/// `<root>/<name>`; the root path has no leading or trailing slash.
-fn join_share(root: &str, name: &str) -> String {
-    if root.is_empty() {
-        name.to_string()
-    } else {
-        format!("{root}/{name}")
-    }
-}
-
-/// The parent path inside the share, or `None` at the share root. A top-level
-/// entry's parent is the root itself (the empty path).
-fn parent_share_path(path: &str) -> Option<String> {
-    if path.is_empty() {
-        return None;
-    }
-    Some(match path.rsplit_once('/') {
-        Some((parent, _)) => parent.to_string(),
-        None => String::new(),
-    })
-}
-
-fn kind_rank(kind: Kind) -> u8 {
+fn kind_rank(kind: EntryKind) -> u8 {
     match kind {
-        Kind::Dir => 0,
-        Kind::File => 1,
+        EntryKind::Dir => 0,
+        EntryKind::File => 1,
     }
 }
 
 /// Classify an entry, following symlinks via metadata; unreadable entries yield `None`.
-fn classify(path: &Path, file_type: std::io::Result<std::fs::FileType>) -> Option<Kind> {
+fn classify(path: &Path, file_type: std::io::Result<std::fs::FileType>) -> Option<EntryKind> {
     match file_type {
-        Ok(ft) if ft.is_dir() => Some(Kind::Dir),
-        Ok(ft) if ft.is_file() => Some(Kind::File),
+        Ok(ft) if ft.is_dir() => Some(EntryKind::Dir),
+        Ok(ft) if ft.is_file() => Some(EntryKind::File),
         _ => {
             let meta = std::fs::metadata(path).ok()?;
             if meta.is_dir() {
-                Some(Kind::Dir)
+                Some(EntryKind::Dir)
             } else if meta.is_file() {
-                Some(Kind::File)
+                Some(EntryKind::File)
             } else {
                 None
             }
@@ -402,7 +367,6 @@ fn classify(path: &Path, file_type: std::io::Result<std::fs::FileType>) -> Optio
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::picker::Kind::File;
     use std::fs;
 
     fn names(picker: &Picker) -> Vec<&str> {
@@ -429,8 +393,8 @@ mod tests {
             names(&picker),
             vec!["Alpha", "beta", "alpha.nsp", "Zeta.nsp"]
         );
-        assert_eq!(picker.entries()[0].kind, Kind::Dir);
-        assert_eq!(picker.entries()[2].kind, File);
+        assert_eq!(picker.entries()[0].kind, EntryKind::Dir);
+        assert_eq!(picker.entries()[2].kind, EntryKind::File);
     }
 
     #[test]
@@ -578,7 +542,7 @@ mod tests {
 
     // --- share browsing -------------------------------------------------
 
-    fn list_entry(name: &str, kind: dbi_backend_core::source::EntryKind, size: u64) -> ListEntry {
+    fn list_entry(name: &str, kind: EntryKind, size: u64) -> ListEntry {
         ListEntry {
             name: name.to_string(),
             kind,
@@ -590,7 +554,7 @@ mod tests {
     fn a_share_picker_starts_busy_and_takes_the_listing() {
         let mut picker = Picker::at_share("nas", "");
         assert!(picker.is_busy());
-        assert_eq!(picker.origin_display(), "nas:/");
+        assert_eq!(picker.origin().display(), "nas:/");
         assert!(picker.entries().is_empty());
         assert_eq!(
             picker.reload_request(),
@@ -606,14 +570,14 @@ mod tests {
                 path: "".into(),
             },
             vec![
-                list_entry("Switch", dbi_backend_core::source::EntryKind::Dir, 0),
-                list_entry("game.nsp", dbi_backend_core::source::EntryKind::File, 42),
+                list_entry("Switch", EntryKind::Dir, 0),
+                list_entry("game.nsp", EntryKind::File, 42),
             ],
         );
         assert!(!picker.is_busy());
         assert_eq!(picker.reload_request(), None);
         assert_eq!(names(&picker), vec!["Switch", "game.nsp"]);
-        assert_eq!(picker.entries()[0].kind, Kind::Dir);
+        assert_eq!(picker.entries()[0].kind, EntryKind::Dir);
         assert_eq!(picker.entries()[1].size, Some(42));
         assert_eq!(
             picker.entries()[1].source,
@@ -641,16 +605,12 @@ mod tests {
                 share: "nas".into(),
                 path: "".into(),
             },
-            vec![list_entry(
-                "Switch",
-                dbi_backend_core::source::EntryKind::Dir,
-                0,
-            )],
+            vec![list_entry("Switch", EntryKind::Dir, 0)],
         );
         picker.move_down();
         picker.descend();
         assert!(picker.is_busy());
-        assert_eq!(picker.origin_display(), "nas:/Switch");
+        assert_eq!(picker.origin().display(), "nas:/Switch");
         assert_eq!(picker.entries().len(), 0);
         assert_eq!(
             picker.reload_request(),
@@ -669,17 +629,10 @@ mod tests {
             share: "nas".into(),
             path: "library/switch".into(),
         };
-        picker.apply_share_listing(
-            &root,
-            vec![list_entry(
-                "Games",
-                dbi_backend_core::source::EntryKind::Dir,
-                0,
-            )],
-        );
+        picker.apply_share_listing(&root, vec![list_entry("Games", EntryKind::Dir, 0)]);
         picker.move_down();
         picker.descend();
-        assert_eq!(picker.origin_display(), "nas:/library/switch/Games");
+        assert_eq!(picker.origin().display(), "nas:/library/switch/Games");
 
         // Up: back to the root, which is listed again (its listing was
         // discarded on the way down).
@@ -695,16 +648,9 @@ mod tests {
 
         // At the root itself, go up does nothing at all — not even towards
         // `library`, which is outside the configured root.
-        picker.apply_share_listing(
-            &root,
-            vec![list_entry(
-                "Games",
-                dbi_backend_core::source::EntryKind::Dir,
-                0,
-            )],
-        );
+        picker.apply_share_listing(&root, vec![list_entry("Games", EntryKind::Dir, 0)]);
         assert_eq!(picker.go_up(), None);
-        assert_eq!(picker.origin_display(), "nas:/library/switch");
+        assert_eq!(picker.origin().display(), "nas:/library/switch");
         assert!(!picker.is_busy());
     }
 
@@ -716,11 +662,7 @@ mod tests {
                 share: "nas".into(),
                 path: "".into(),
             },
-            vec![list_entry(
-                "Switch",
-                dbi_backend_core::source::EntryKind::Dir,
-                0,
-            )],
+            vec![list_entry("Switch", EntryKind::Dir, 0)],
         );
         picker.move_down();
         picker.descend();
@@ -734,7 +676,7 @@ mod tests {
             }))
         );
         assert!(picker.is_busy());
-        assert_eq!(picker.origin_display(), "nas:/");
+        assert_eq!(picker.origin().display(), "nas:/");
     }
 
     #[test]
@@ -746,8 +688,8 @@ mod tests {
                 path: "".into(),
             },
             vec![
-                list_entry("alpha.nsp", dbi_backend_core::source::EntryKind::File, 1),
-                list_entry("beta.nsp", dbi_backend_core::source::EntryKind::File, 2),
+                list_entry("alpha.nsp", EntryKind::File, 1),
+                list_entry("beta.nsp", EntryKind::File, 2),
             ],
         );
         filter_with(&mut picker, "BETA");
@@ -757,6 +699,6 @@ mod tests {
     #[test]
     fn share_root_with_configured_root_names_it() {
         let picker = Picker::at_share("nas", "library/switch");
-        assert_eq!(picker.origin_display(), "nas:/library/switch");
+        assert_eq!(picker.origin().display(), "nas:/library/switch");
     }
 }

@@ -8,7 +8,6 @@ pub const HEADER_LEN: usize = 16;
 pub const BUFFER_SEGMENT_DATA_SIZE: usize = 0x100000;
 
 pub const CMD_ID_EXIT: u32 = 0;
-pub const CMD_ID_LIST_OLD: u32 = 1;
 pub const CMD_ID_FILE_RANGE: u32 = 2;
 pub const CMD_ID_LIST: u32 = 3;
 
@@ -103,10 +102,10 @@ impl FileRangeHeader {
 }
 
 /// Build the LIST payload: each name followed by a newline, UTF-8 encoded.
-pub fn build_list(names: impl IntoIterator<Item = String>) -> Vec<u8> {
+pub fn build_list(names: impl IntoIterator<Item = impl AsRef<str>>) -> Vec<u8> {
     let mut out = String::new();
     for name in names {
-        out.push_str(&name);
+        out.push_str(name.as_ref());
         out.push('\n');
     }
     out.into_bytes()

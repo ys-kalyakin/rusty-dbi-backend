@@ -8,15 +8,13 @@ license.workspace = true
 name = "dbi_backend_core"
 path = "src/lib.rs"
 
-[features]
-test-util = []
-
 [dependencies]
 async-trait.workspace = true
 thiserror.workspace = true
 nusb.workspace = true
 tokio.workspace = true
 smb2.workspace = true
+globset.workspace = true
 
 [dev-dependencies]
 tokio.workspace = true
