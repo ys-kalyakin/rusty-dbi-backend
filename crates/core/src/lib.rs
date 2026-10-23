@@ -1,5 +1,6 @@
 pub mod filelist;
 pub mod filters;
+pub mod http;
 pub mod metadata;
 pub mod protocol;
 pub mod server;
