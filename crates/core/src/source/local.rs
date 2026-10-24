@@ -214,9 +214,10 @@ mod tests {
             .await
             .err()
             .unwrap();
+        // Windows reports os error 3 where unix reports 2 for a missing path.
         assert!(
-            err.message.ends_with("(os error 2)"),
-            "the raw error code is kept: {}",
+            err.message.ends_with("(os error 2)") || err.message.ends_with("(os error 3)"),
+            "a not-found raw code is kept: {}",
             err.message
         );
     }
@@ -231,9 +232,10 @@ mod tests {
             .await
             .err()
             .unwrap();
+        // Windows reports os error 3 where unix reports 2 for a missing path.
         assert!(
-            err.message.ends_with("(os error 2)"),
-            "the raw error code is kept: {}",
+            err.message.ends_with("(os error 2)") || err.message.ends_with("(os error 3)"),
+            "a not-found raw code is kept: {}",
             err.message
         );
     }
