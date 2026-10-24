@@ -3,9 +3,8 @@
 ## Purpose
 
 How the backend reaches users on Windows, macOS, and Linux: the platform
-matrix CI verifies on every change, the release artifacts and crates.io
-publishes a version tag produces, and the platform-specific setup
-documentation a user installs by.
+matrix CI verifies on every change, the release artifacts a version tag
+produces, and the platform-specific setup documentation a user installs by.
 
 ## Requirements
 
@@ -70,28 +69,21 @@ lockfile and SHALL fail if the lockfile would change.
 - **WHEN** a tagged build would change the committed lockfile
 - **THEN** the build fails and no release is published
 
-### Requirement: A release publishes the crates to crates.io
+### Requirement: Releases are GitHub-only
 
-A release triggered by a version tag SHALL publish both crates to crates.io in
-dependency order — the core library first, then the application — and each
-crate SHALL carry the metadata crates.io requires: a description, a license,
-a repository link, and a readme. Publishing SHALL NOT run on pushes or pull
-requests.
+A version-tag release SHALL consist of the GitHub release and its platform
+archives with their checksums only. The release pipeline SHALL NOT publish
+anything to crates.io and SHALL NOT require a registry token.
 
-#### Scenario: A tag publishes core before the application
+#### Scenario: A completed release sends nothing to crates.io
 
-- **WHEN** a release triggered by a version tag publishes
-- **THEN** the core library is published first and the application crate is published after it
+- **WHEN** a release run triggered by a version tag completes
+- **THEN** the GitHub release holds the archives and the checksum file, and no crate version is uploaded to crates.io
 
-#### Scenario: A dry-run publish passes with the crate metadata
+#### Scenario: No registry token is needed
 
-- **WHEN** the crate metadata is validated with a publish dry-run
-- **THEN** it succeeds without complaining about missing description, license, repository, or readme
-
-#### Scenario: An untagged build publishes no crates
-
-- **WHEN** CI runs on an ordinary push or pull request
-- **THEN** nothing is sent to crates.io
+- **WHEN** the release pipeline runs
+- **THEN** it references no crates.io registry credential
 
 ### Requirement: Windows USB setup is documented
 

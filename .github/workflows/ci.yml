@@ -38,19 +38,3 @@ jobs:
         with:
           targets: ${{ matrix.target }}
       - run: cargo test --workspace --locked --target ${{ matrix.target }}
-
-  publish-readiness:
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      # A full dry-run works for the leaf crate only: the app crate cannot
-      # resolve its not-yet-published workspace dep against the registry,
-      # so its own metadata is checked via cargo metadata instead.
-      - run: cargo publish --dry-run --locked -p dbi-backend-core
-      - run: |-
-          missing=$(cargo metadata --no-deps --format-version 1 | jq -r '
-            .packages[]
-            | select(.description == null or .license == null or .readme == null or .repository == null)
-            | .name + " misses publish metadata"')
-          if [ -n "$missing" ]; then echo "$missing"; exit 1; fi

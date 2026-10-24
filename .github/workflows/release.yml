@@ -85,23 +85,3 @@ jobs:
       - run: gh release create "$GITHUB_REF_NAME" out/* --title "$GITHUB_REF_NAME" --generate-notes
         env:
           GH_TOKEN: ${{ github.token }}
-
-  publish:
-    needs: release
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - run: cargo publish --locked -p dbi-backend-core
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}
-      # The sparse registry index needs a moment before the app crate can
-      # resolve the just-uploaded core dependency; retry before giving up.
-      - run: |-
-          for _ in 1 2 3 4 5; do
-            sleep 30
-            if cargo publish --locked -p dbi-backend; then exit 0; fi
-          done
-          exit 1
-        env:
-          CARGO_REGISTRY_TOKEN: ${{ secrets.CARGO_REGISTRY_TOKEN }}

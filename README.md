@@ -15,7 +15,9 @@ Grab a prebuilt archive from
 `dbi-backend-<version>-<target>.zip` on Windows, `.tar.gz` on Linux and macOS —
 check it against the release's `SHA256SUMS.txt`, and unpack `dbi-backend` (or
 `dbi-backend.exe`) anywhere on your `PATH`. Or build and install from source
-with `cargo install dbi-backend`. Platform setup notes live under
+with
+`cargo install --git https://github.com/ys-kalyakin/rusty-dbi-backend dbi-backend`.
+Platform setup notes live under
 [Platform notes](#platform-notes) below.
 
 ## Build
