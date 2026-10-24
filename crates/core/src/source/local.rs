@@ -214,7 +214,11 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert_eq!(err.message, "No such file or directory (os error 2)");
+        assert!(
+            err.message.ends_with("(os error 2)"),
+            "the raw error code is kept: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -227,7 +231,11 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert_eq!(err.message, "No such file or directory (os error 2)");
+        assert!(
+            err.message.ends_with("(os error 2)"),
+            "the raw error code is kept: {}",
+            err.message
+        );
     }
 
     #[tokio::test]

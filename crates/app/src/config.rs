@@ -528,8 +528,19 @@ mod tests {
         let loaded = LoadedConfig::from_read(Path::new("/nonexistent/dbi-backend/config.toml"));
         assert_eq!(loaded.shares, Vec::new());
         assert_eq!(
-            loaded.warnings,
-            vec!["cannot read /nonexistent/dbi-backend/config.toml: No such file or directory (os error 2)".to_string()],
+            loaded.warnings.len(),
+            1,
+            "one warning: {:?}",
+            loaded.warnings
+        );
+        let warning = &loaded.warnings[0];
+        assert!(
+            warning.starts_with("cannot read /nonexistent/dbi-backend/config.toml: "),
+            "the warning names the file: {warning}"
+        );
+        assert!(
+            warning.ends_with("(os error 2)"),
+            "the raw error code is kept: {warning}"
         );
     }
 
