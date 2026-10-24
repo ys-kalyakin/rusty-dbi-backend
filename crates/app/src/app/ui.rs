@@ -427,20 +427,21 @@ fn render_picker(frame: &mut Frame, picker: &Picker, area: Rect) {
     } else {
         plural(picker.entries().len(), "match", "matches")
     };
+    // Keep the count (and filter) inside the panel however long the path is.
+    let reserve = if picker.filter().is_empty() { 32 } else { 48 };
+    let origin = abbrev_path(
+        &picker.origin().display().to_string(),
+        (area.width as usize).saturating_sub(reserve),
+    );
     let title = if picker.is_busy() {
-        format!("Pick a path: {} · listing…", picker.origin().display())
+        format!("Pick a path: {origin} · listing…")
     } else if picker.error().is_some() {
-        format!(
-            "Pick a path: {} · {}",
-            picker.origin().display(),
-            picker.error().unwrap()
-        )
+        format!("Pick a path: {origin} · {}", picker.error().unwrap())
     } else if picker.filter().is_empty() {
-        format!("Pick a path: {} · {count}", picker.origin().display())
+        format!("Pick a path: {origin} · {count}")
     } else {
         format!(
-            "Pick a path: {}  [filter: {}] · {count}",
-            picker.origin().display(),
+            "Pick a path: {origin}  [filter: {}] · {count}",
             picker.filter()
         )
     };
@@ -460,7 +461,10 @@ fn render_shares(frame: &mut Frame, app: &App, list: &ShareList, area: Rect) {
                 "Shares",
                 format!(
                     "No shares configured — press `a` to add one (saved to {})",
-                    path.display()
+                    abbrev_path(
+                        &path.display().to_string(),
+                        (area.width as usize).saturating_sub(58)
+                    )
                 ),
                 area,
             ),

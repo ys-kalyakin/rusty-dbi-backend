@@ -1,6 +1,8 @@
 //! Share definitions from the configuration file.
 //!
-//! Shares are configured in `~/.config/dbi-backend/config.toml` under a
+//! Shares are configured in the config file, `config.toml` in the backend's
+//! config directory (`~/.config/dbi-backend/` on Linux, `%APPDATA%\dbi-backend\`
+//! on Windows, `~/Library/Application Support/dbi-backend/` on macOS), under a
 //! `[[shares]]` array, one entry per share. Every entry needs `name` (a
 //! display name), `server` (`host` or `host:port`, port 445 by default),
 //! `share`, and `username`; optional `domain` and `root` (the browsable root
@@ -526,8 +528,21 @@ mod tests {
         let loaded = LoadedConfig::from_read(Path::new("/nonexistent/dbi-backend/config.toml"));
         assert_eq!(loaded.shares, Vec::new());
         assert_eq!(
-            loaded.warnings,
-            vec!["cannot read /nonexistent/dbi-backend/config.toml: No such file or directory (os error 2)".to_string()],
+            loaded.warnings.len(),
+            1,
+            "one warning: {:?}",
+            loaded.warnings
+        );
+        let warning = &loaded.warnings[0];
+        assert!(
+            warning.starts_with("cannot read /nonexistent/dbi-backend/config.toml: "),
+            "the warning names the file: {warning}"
+        );
+        // Windows reports os error 3 when an intermediate directory of the
+        // path is missing, 2 (like unix) only for a missing final component.
+        assert!(
+            warning.ends_with("(os error 2)") || warning.ends_with("(os error 3)"),
+            "a not-found raw code is kept: {warning}"
         );
     }
 

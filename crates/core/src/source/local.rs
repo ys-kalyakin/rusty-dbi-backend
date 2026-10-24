@@ -160,6 +160,7 @@ mod tests {
         assert_eq!(entries[1].size, 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn list_dir_lists_file_symlinks_and_skips_dir_and_broken_ones() {
         let dir = tempfile::tempdir().unwrap();
@@ -213,7 +214,12 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert_eq!(err.message, "No such file or directory (os error 2)");
+        // Windows reports os error 3 where unix reports 2 for a missing path.
+        assert!(
+            err.message.ends_with("(os error 2)") || err.message.ends_with("(os error 3)"),
+            "a not-found raw code is kept: {}",
+            err.message
+        );
     }
 
     #[tokio::test]
@@ -226,7 +232,12 @@ mod tests {
             .await
             .err()
             .unwrap();
-        assert_eq!(err.message, "No such file or directory (os error 2)");
+        // Windows reports os error 3 where unix reports 2 for a missing path.
+        assert!(
+            err.message.ends_with("(os error 2)") || err.message.ends_with("(os error 3)"),
+            "a not-found raw code is kept: {}",
+            err.message
+        );
     }
 
     #[tokio::test]

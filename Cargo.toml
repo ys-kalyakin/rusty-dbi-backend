@@ -6,8 +6,13 @@ members = ["crates/core", "crates/app"]
 version = "0.1.0"
 edition = "2021"
 license = "MIT"
+description = "A USB and HTTP install backend for DBI, the Nintendo Switch homebrew installer"
+repository = "https://github.com/ys-kalyakin/rusty-dbi-backend"
+readme = "README.md"
+keywords = ["nintendo-switch", "dbi", "usb", "homebrew", "installer"]
 
 [workspace.dependencies]
+dbi-backend-core = { path = "crates/core", version = "0.1.0" }
 tokio = { version = "1", features = ["rt-multi-thread", "macros", "time", "sync"] }
 nusb = { version = "0.2", features = ["tokio"] }
 async-trait = "0.1"
