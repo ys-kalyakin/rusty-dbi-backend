@@ -3,13 +3,18 @@ name = "dbi-backend"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description.workspace = true
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
+categories = ["command-line-utilities"]
 
 [[bin]]
 name = "dbi-backend"
 path = "src/main.rs"
 
 [dependencies]
-dbi-backend-core = { path = "../core" }
+dbi-backend-core.workspace = true
 anyhow.workspace = true
 clap.workspace = true
 ratatui.workspace = true

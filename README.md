@@ -8,6 +8,16 @@ It listens for the Switch over USB (VID `0x057E`, PID `0x3000`), answers the DBI
 protocol commands `LIST`, `FILE_RANGE`, and `EXIT`, and streams the requested
 byte ranges of your NSP files.
 
+## Install
+
+Grab a prebuilt archive from
+[GitHub Releases](https://github.com/ys-kalyakin/rusty-dbi-backend/releases) —
+`dbi-backend-<version>-<target>.zip` on Windows, `.tar.gz` on Linux and macOS —
+check it against the release's `SHA256SUMS.txt`, and unpack `dbi-backend` (or
+`dbi-backend.exe`) anywhere on your `PATH`. Or build and install from source
+with `cargo install dbi-backend`. Platform setup notes live under
+[Platform notes](#platform-notes) below.
+
 ## Build
 
 ```bash
@@ -81,7 +91,8 @@ search never changes what the Switch receives — it is a view, not a filter.
 ## Share browsing
 
 Games can also install straight from an SMB share. Configure the shares in
-`~/.config/dbi-backend/config.toml` (create the directory if it is missing):
+the config file — `config.toml` in the [config directory](#platform-notes) for
+your OS (create the directory if it is missing):
 
 ```toml
 [[shares]]
@@ -133,7 +144,14 @@ host = "0.0.0.0" # every interface by default
 port = 65080
 ```
 
-## Linux permissions
+## Platform notes
+
+The backend runs on Linux, Windows, and macOS, on both Intel and Apple Silicon
+Macs. The config file lives in `<config dir>/dbi-backend/config.toml`, where the
+config dir is `~/.config` on Linux, `%APPDATA%` on Windows, and
+`~/Library/Application Support` on macOS.
+
+### Linux
 
 Opening the USB device requires access to the `/dev/bus/usb/...` node. Install the
 provided udev rule and add your user to the `plugdev` group:
@@ -143,6 +161,25 @@ sudo cp contrib/99-nintendo-switch.rules /etc/udev/rules.d/
 sudo udevadm control --reload-rules && sudo udevadm trigger
 sudo usermod -aG plugdev "$USER"   # log out and back in
 ```
+
+### Windows
+
+USB installs need a WinUSB-compatible driver bound to the Switch — Windows
+ships none for DBI's transfer interface. Install it once with
+[Zadig](https://zadig.akeo.ie/): put the Switch on DBI's USB install screen
+(the device at vendor `057E`, product `3000`), enable *Options → List All
+Devices*, pick the Nintendo Switch, and install **WinUSB** (libusbK, which
+DBI's docs also name, works the same). After that, run `dbi-backend.exe` and
+install over USB as usual.
+
+Installs over HTTP need none of this: start the server with `H`, add the
+`Home server` source on the console, and Windows never touches the USB stack.
+
+### macOS
+
+Everything works natively — USB installs, HTTP installs, SMB shares — with no
+driver installation and no permission setup: plug the cable in and start the
+server.
 
 ## Protocol
 

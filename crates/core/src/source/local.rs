@@ -160,6 +160,7 @@ mod tests {
         assert_eq!(entries[1].size, 0);
     }
 
+    #[cfg(unix)]
     #[tokio::test]
     async fn list_dir_lists_file_symlinks_and_skips_dir_and_broken_ones() {
         let dir = tempfile::tempdir().unwrap();

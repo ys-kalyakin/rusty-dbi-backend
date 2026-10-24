@@ -1,6 +1,8 @@
 //! Share definitions from the configuration file.
 //!
-//! Shares are configured in `~/.config/dbi-backend/config.toml` under a
+//! Shares are configured in the config file, `config.toml` in the backend's
+//! config directory (`~/.config/dbi-backend/` on Linux, `%APPDATA%\dbi-backend\`
+//! on Windows, `~/Library/Application Support/dbi-backend/` on macOS), under a
 //! `[[shares]]` array, one entry per share. Every entry needs `name` (a
 //! display name), `server` (`host` or `host:port`, port 445 by default),
 //! `share`, and `username`; optional `domain` and `root` (the browsable root

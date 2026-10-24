@@ -8,7 +8,7 @@ env:
   CARGO_TERM_COLOR: always
 
 jobs:
-  check:
+  lint:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
@@ -17,4 +17,40 @@ jobs:
           components: rustfmt, clippy
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
-      - run: cargo test --workspace
+
+  test:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-latest
+            target: x86_64-unknown-linux-gnu
+          - os: windows-latest
+            target: x86_64-pc-windows-msvc
+          - os: macos-latest
+            target: x86_64-apple-darwin
+          - os: macos-latest
+            target: aarch64-apple-darwin
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+      - run: cargo test --workspace --locked --target ${{ matrix.target }}
+
+  publish-readiness:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      # A full dry-run works for the leaf crate only: the app crate cannot
+      # resolve its not-yet-published workspace dep against the registry,
+      # so its own metadata is checked via cargo metadata instead.
+      - run: cargo publish --dry-run --locked -p dbi-backend-core
+      - run: |-
+          missing=$(cargo metadata --no-deps --format-version 1 | jq -r '
+            .packages[]
+            | select(.description == null or .license == null or .readme == null or .repository == null)
+            | .name + " misses publish metadata"')
+          if [ -n "$missing" ]; then echo "$missing"; exit 1; fi

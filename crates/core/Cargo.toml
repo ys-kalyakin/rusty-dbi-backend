@@ -3,6 +3,10 @@ name = "dbi-backend-core"
 version.workspace = true
 edition.workspace = true
 license.workspace = true
+description = "The DBI0 protocol, file sources, and USB/HTTP servers behind dbi-backend"
+repository.workspace = true
+readme.workspace = true
+keywords.workspace = true
 
 [lib]
 name = "dbi_backend_core"
