@@ -538,9 +538,11 @@ mod tests {
             warning.starts_with("cannot read /nonexistent/dbi-backend/config.toml: "),
             "the warning names the file: {warning}"
         );
+        // Windows reports os error 3 when an intermediate directory of the
+        // path is missing, 2 (like unix) only for a missing final component.
         assert!(
-            warning.ends_with("(os error 2)"),
-            "the raw error code is kept: {warning}"
+            warning.ends_with("(os error 2)") || warning.ends_with("(os error 3)"),
+            "a not-found raw code is kept: {warning}"
         );
     }
 
